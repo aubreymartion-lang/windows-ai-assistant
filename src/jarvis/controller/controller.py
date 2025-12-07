@@ -87,6 +87,26 @@ class Controller:
         self.dispatcher = Dispatcher(self.executor_server)
         
         self.memory_store = memory_store
+        
+        # Action keywords for intent classification
+        self._action_keywords = {
+            # File operations
+            "create", "delete", "remove", "open", "close", "move", "copy", "rename", 
+            "list", "show", "get", "read", "write", "save", "find", "search",
+            # System operations  
+            "run", "execute", "start", "stop", "kill", "launch", "install", "uninstall",
+            "restart", "reboot", "shutdown",
+            # GUI operations
+            "click", "move", "drag", "drop", "type", "press", "capture", "screenshot",
+            "scroll", "minimize", "maximize", "resize", "focus", "activate",
+            # Registry operations
+            "registry", "reg", "edit", "modify", "update", "configure", "settings",
+            # Network operations
+            "download", "upload", "connect", "disconnect", "ping", "network",
+            # General action verbs
+            "enable", "disable", "toggle", "switch", "change", "set", "adjust",
+        }
+        
         logger.info("Controller initialized")
 
     def process_command(self, user_input: str) -> ControllerResult:
