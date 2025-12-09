@@ -7,6 +7,7 @@ validated plans using an LLM client with self-verification.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,12 @@ from jarvis.config import JarvisConfig
 from jarvis.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
+
+
+class PlanningResponseError(Exception):
+    """Raised when the LLM response cannot be parsed into a valid plan."""
+
+    pass
 
 
 class StepStatus(str, Enum):
@@ -191,12 +198,17 @@ class ReasoningModule:
 
         response_text = self.llm_client.generate(prompt)
         logger.debug(f"Raw LLM response length: {len(response_text)} characters")
-        logger.debug(f"Raw LLM response:\n{response_text}")
+        # Sanitize logging to avoid leaking full response in production logs if sensitive
+        logger.debug(f"Raw LLM response snippet:\n{response_text[:500]}...")
 
-        response = self._parse_planning_response(response_text)
-        logger.debug(f"Parsed planning response: {response}")
-
-        steps = self._parse_plan_steps(response, user_input)
+        try:
+            response = self._parse_planning_response(response_text)
+            logger.debug(f"Parsed planning response: {response}")
+            steps = self._parse_plan_steps(response, user_input)
+        except PlanningResponseError as e:
+            logger.warning(f"Planning parsing failed: {e}. Using fallback plan.")
+            steps = self._generate_fallback_plan(user_input)
+            response = {"description": f"Fallback plan for: {user_input}"}
 
         plan = Plan(
             plan_id=plan_id,
@@ -314,91 +326,112 @@ Return only valid JSON, no other text.
         """
         Parse LLM response into a planning JSON structure.
 
-        Handles JSON extraction from various response formats and converts
-        string representations of complex fields to proper types.
-
         Args:
             response_text: Raw LLM response text
 
         Returns:
             Dictionary with "description" and "steps" keys
+
+        Raises:
+            PlanningResponseError: If parsing fails
         """
         if not response_text or not response_text.strip():
-            logger.warning("Empty response from LLM")
-            return {"description": "", "steps": []}
+            raise PlanningResponseError("Empty response from LLM")
 
-        text = response_text.strip()
+        # 1. Try parsing extracted JSON block
+        json_candidate = self._extract_json_candidate(response_text)
 
         try:
-            # Try to extract JSON from markdown code blocks
-            if "```" in text:
-                # Look for json code block
-                start_idx = text.find("```json")
-                if start_idx >= 0:
-                    start_idx = text.find("\n", start_idx) + 1
-                    end_idx = text.find("```", start_idx)
-                    if end_idx > start_idx:
-                        text = text[start_idx:end_idx].strip()
-                else:
-                    # Try generic code block
-                    start_idx = text.find("```")
-                    if start_idx >= 0:
-                        start_idx = text.find("\n", start_idx) + 1
-                        end_idx = text.find("```", start_idx)
-                        if end_idx > start_idx:
-                            text = text[start_idx:end_idx].strip()
+            return self._parse_json_content(json_candidate)
+        except json.JSONDecodeError:
+            pass
 
-            # If text starts with { or [, it's likely JSON
-            if text.startswith("{"):
-                json_text = text
-            elif text.startswith("["):
-                # Handle array responses - wrap in object with steps key
-                json_text = text
-            else:
-                # Try to find JSON object in the text
-                json_start = text.find("{")
-                json_end = text.rfind("}")
-                if json_start >= 0 and json_end > json_start:
-                    json_text = text[json_start : json_end + 1]
-                else:
-                    # Try to find JSON array
-                    json_start = text.find("[")
-                    json_end = text.rfind("]")
-                    if json_start >= 0 and json_end > json_start:
-                        json_text = text[json_start : json_end + 1]
-                    else:
-                        logger.warning(f"No valid JSON found in response: {response_text[:200]}")
-                        return {"description": "", "steps": []}
-
-            # Parse the JSON
-            parsed = json.loads(json_text)
-
-            # Handle case where LLM returns just an array of steps
-            if isinstance(parsed, list):
-                logger.debug("LLM returned array of steps directly")
-                return {"description": "Plan for execution", "steps": parsed}
-
-            # Handle case where LLM returns an object
-            if isinstance(parsed, dict):
-                # Ensure we have the required keys
-                if "description" not in parsed:
-                    parsed["description"] = "Plan for execution"
-                if "steps" not in parsed:
-                    parsed["steps"] = []
-
-                return parsed
-
-            logger.warning(f"Unexpected JSON structure: {type(parsed)}")
-            return {"description": "", "steps": []}
-
+        # 2. Try repairing the candidate
+        repaired_json = self._repair_json(json_candidate)
+        try:
+            return self._parse_json_content(repaired_json)
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse planning response as JSON: {e}")
-            logger.debug(f"Response text was: {response_text[:500]}")
-            return {"description": "", "steps": []}
-        except Exception as e:
-            logger.error(f"Unexpected error parsing planning response: {e}")
-            logger.debug(f"Response text was: {response_text[:500]}")
-            return {"description": "", "steps": []}
+            logger.warning(f"Failed to parse repaired JSON: {e}")
+            raise PlanningResponseError(f"Failed to parse planning response: {e}")
+
+    def _extract_json_candidate(self, text: str) -> str:
+        """Extract the most likely JSON content from text."""
+        text = text.strip()
+
+        # Try to find markdown code blocks
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+        # Try to find JSON object or array
+        # Find first { or [
+        start_brace = text.find("{")
+        start_bracket = text.find("[")
+
+        start_idx = -1
+        if start_brace != -1 and start_bracket != -1:
+            start_idx = min(start_brace, start_bracket)
+        elif start_brace != -1:
+            start_idx = start_brace
+        elif start_bracket != -1:
+            start_idx = start_bracket
+
+        if start_idx != -1:
+            # Find last } or ]
+            end_brace = text.rfind("}")
+            end_bracket = text.rfind("]")
+            end_idx = max(end_brace, end_bracket)
+
+            if end_idx > start_idx:
+                return text[start_idx : end_idx + 1]
+
+        return text
+
+    def _repair_json(self, text: str) -> str:
+        """Attempt to repair malformed JSON."""
+        # 1. Normalize quotes (replace smart quotes)
+        text = text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+
+        # 2. Handle single quotes for keys
+        # Replace 'key': with "key":
+        text = re.sub(r"'([^']*)'\s*:", r'"\1":', text)
+
+        # 3. Handle single quotes for string values
+        # This is risky, so we only do it for simple cases: : 'value'
+        text = re.sub(r":\s*'([^']*)'", r': "\1"', text)
+
+        # 4. Handle trailing commas before } or ]
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+
+        # 5. Balance braces/brackets
+        open_braces = text.count("{")
+        close_braces = text.count("}")
+        if open_braces > close_braces:
+            text += "}" * (open_braces - close_braces)
+
+        open_brackets = text.count("[")
+        close_brackets = text.count("]")
+        if open_brackets > close_brackets:
+            text += "]" * (open_brackets - close_brackets)
+
+        return text
+
+    def _parse_json_content(self, json_text: str) -> Dict[str, Any]:
+        """Parse JSON text and validate structure."""
+        parsed = json.loads(json_text)
+
+        if isinstance(parsed, list):
+            logger.debug("LLM returned array of steps directly")
+            return {"description": "Plan for execution", "steps": parsed}
+
+        if isinstance(parsed, dict):
+            if "description" not in parsed:
+                parsed["description"] = "Plan for execution"
+            if "steps" not in parsed:
+                parsed["steps"] = []
+            return parsed
+
+        raise PlanningResponseError(f"Unexpected JSON structure: {type(parsed)}")
 
     def _parse_plan_steps(self, response: Dict[str, Any], user_input: str) -> List[PlanStep]:
         """
@@ -413,10 +446,15 @@ Return only valid JSON, no other text.
         """
         steps_data = response.get("steps", [])
 
-        logger.debug(f"Attempting to parse steps. steps_data type: {type(steps_data)}, length: {len(steps_data) if isinstance(steps_data, (list, dict)) else 'N/A'}")
+        logger.debug(
+            f"Attempting to parse steps. steps_data type: {type(steps_data)}, "
+            f"length: {len(steps_data) if isinstance(steps_data, (list, dict)) else 'N/A'}"
+        )
 
         if not steps_data:
-            logger.warning(f"LLM did not provide steps (steps_data={steps_data}), generating fallback plan")
+            logger.warning(
+                f"LLM did not provide steps (steps_data={steps_data}), generating fallback plan"
+            )
             logger.debug(f"Full response was: {response}")
             return self._generate_fallback_plan(user_input)
 
@@ -458,7 +496,9 @@ Return only valid JSON, no other text.
                 continue
 
         if not steps:
-            logger.warning(f"Failed to parse any steps from {len(steps_data)} step entries, using fallback")
+            logger.warning(
+                f"Failed to parse any steps from {len(steps_data)} step entries, using fallback"
+            )
             steps = self._generate_fallback_plan(user_input)
 
         return steps
