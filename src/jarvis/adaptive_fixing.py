@@ -243,7 +243,7 @@ class AdaptiveFixEngine:
         return tags
 
     def retry_step_with_fix(
-        self, step: CodeStep, fixed_code: str, max_retries: int = 3
+        self, step: CodeStep, fixed_code: str, max_retries: int = 10
     ) -> Tuple[bool, str, Optional[str]]:
         """
         Execute fixed code and check if it passes.

@@ -1,26 +1,18 @@
 # Tests for execution verifier and fallback strategies modules.
 
-import pytest
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import MagicMock, Mock, patch
 
-from jarvis.action_executor import ActionResult
+import pytest
 
 # Import from our modules, handling optional dependencies
 import jarvis.execution_verifier as ev_module
+from jarvis.action_executor import ActionResult
 
 # Set psutil as unavailable for testing
 ev_module.PSUTIL_AVAILABLE = False
 ev_module.psutil = None
 
-from jarvis.execution_verifier import (
-    ApplicationVerifier,
-    DiagnosticsCollector,
-    ExecutionVerifier,
-    FileVerifier,
-    InputVerifier,
-    VerificationResult,
-)
 from jarvis.action_fallback_strategies import (
     ApplicationFallbackStrategy,
     ExecutionReport,
@@ -28,6 +20,14 @@ from jarvis.action_fallback_strategies import (
     PathFallbackStrategy,
     RetryAttempt,
     StrategyExecutor,
+)
+from jarvis.execution_verifier import (
+    ApplicationVerifier,
+    DiagnosticsCollector,
+    ExecutionVerifier,
+    FileVerifier,
+    InputVerifier,
+    VerificationResult,
 )
 
 
@@ -177,7 +177,7 @@ class TestStrategyExecutor:
 
     def test_single_success_no_verify(self):
         """Test that successful action doesn't trigger retries when no verification."""
-        executor = StrategyExecutor(max_retries=3)
+        executor = StrategyExecutor(max_retries=10, backoff_base=0.01, backoff_multiplier=1.0)
 
         def mock_action(**kwargs):
             return ActionResult(
@@ -201,7 +201,7 @@ class TestStrategyExecutor:
 
     def test_single_success_with_verify(self):
         """Test that successful action stops after verification passes."""
-        executor = StrategyExecutor(max_retries=3)
+        executor = StrategyExecutor(max_retries=10, backoff_base=0.01, backoff_multiplier=1.0)
 
         def mock_action(**kwargs):
             return ActionResult(
@@ -231,7 +231,7 @@ class TestStrategyExecutor:
 
     def test_retry_on_failure(self):
         """Test that failed action triggers retries."""
-        executor = StrategyExecutor(max_retries=3)
+        executor = StrategyExecutor(max_retries=10, backoff_base=0.01, backoff_multiplier=1.0)
         attempt_count = [0]
 
         def mock_action(**kwargs):
@@ -253,10 +253,10 @@ class TestStrategyExecutor:
         )
 
         assert result.success is False
-        assert len(attempts) == 3
+        assert len(attempts) == 10
         assert attempts[0].attempt_number == 1
         assert attempts[1].attempt_number == 2
-        assert attempts[2].attempt_number == 3
+        assert attempts[9].attempt_number == 10
 
     def test_verify_fail_then_success(self):
         """Test that failed verification triggers retries."""

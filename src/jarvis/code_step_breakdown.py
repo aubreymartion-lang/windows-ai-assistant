@@ -78,10 +78,27 @@ class CodeStepBreakdown:
             True if request is complex
         """
         complexity_indicators = [
-            "with", "and", "then", "also", "including", "plus", "multi",
-            "step", "phase", "stage", "pipeline", "workflow",
-            "error handling", "logging", "testing", "validation",
-            "database", "api", "web", "server", "client",
+            "with",
+            "and",
+            "then",
+            "also",
+            "including",
+            "plus",
+            "multi",
+            "step",
+            "phase",
+            "stage",
+            "pipeline",
+            "workflow",
+            "error handling",
+            "logging",
+            "testing",
+            "validation",
+            "database",
+            "api",
+            "web",
+            "server",
+            "client",
         ]
 
         input_lower = user_request.lower()
@@ -205,7 +222,7 @@ Return only valid JSON, no other text."""
                         expected_output_pattern=step_data.get("expected_output_pattern"),
                         dependencies=step_data.get("dependencies", []),
                         timeout_seconds=step_data.get("timeout_seconds", 30),
-                        max_retries=step_data.get("max_retries", 3),
+                        max_retries=step_data.get("max_retries", 10),
                         status="pending",
                     )
                     steps.append(step)

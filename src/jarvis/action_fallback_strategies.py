@@ -281,7 +281,7 @@ class StrategyExecutor:
 
     def __init__(
         self,
-        max_retries: int = 3,
+        max_retries: int = 10,
         backoff_base: float = 1.0,
         backoff_multiplier: float = 2.0,
     ):
@@ -363,9 +363,7 @@ class StrategyExecutor:
                     break
 
                 # If verification failed, check if we should retry
-                logger.warning(
-                    f"Verification failed: {verification_result.error_message}"
-                )
+                logger.warning(f"Verification failed: {verification_result.error_message}")
                 logger.info("Will retry with fallback strategy...")
             elif action_result.success and verify_func is None:
                 # Action succeeded and no verification function, we're done
@@ -388,7 +386,9 @@ class StrategyExecutor:
             attempts.append(
                 RetryAttempt(
                     attempt_number=attempt_num,
-                    strategy_name=self._get_strategy_name(attempt_num, action_type, original_params),
+                    strategy_name=self._get_strategy_name(
+                        attempt_num, action_type, original_params
+                    ),
                     action_type=action_type,
                     params=current_params.copy(),
                     action_result=action_result,
@@ -415,12 +415,16 @@ class StrategyExecutor:
                 )
 
         # Return final result and all attempts
-        final_result = attempts[-1].action_result if attempts else ActionResult(
-            success=False,
-            action_type=action_type,
-            message="No attempts were made",
-            error="Internal error in retry logic",
-            execution_time_ms=0.0,
+        final_result = (
+            attempts[-1].action_result
+            if attempts
+            else ActionResult(
+                success=False,
+                action_type=action_type,
+                message="No attempts were made",
+                error="Internal error in retry logic",
+                execution_time_ms=0.0,
+            )
         )
 
         return final_result, attempts
@@ -449,9 +453,7 @@ class StrategyExecutor:
 
             # Launch methods
             methods = strategy.launch_methods
-            method_idx = min(
-                attempt_num - len(alternatives) - 2, len(methods) - 1
-            )
+            method_idx = min(attempt_num - len(alternatives) - 2, len(methods) - 1)
             return f"alt_method_{methods[method_idx]}"
 
         elif strategy.name == "input_fallback":
@@ -622,9 +624,7 @@ class ExecutionReport:
         """
         successful_attempts = sum(1 for a in self.attempts if a.action_result.success)
         verified_attempts = sum(
-            1
-            for a in self.attempts
-            if a.verification_result and a.verification_result.verified
+            1 for a in self.attempts if a.verification_result and a.verification_result.verified
         )
 
         return {
@@ -713,9 +713,7 @@ class ExecutionReport:
                         break
 
                     if "locked" in error_msg:
-                        recommendations.append(
-                            "Close the file or application that's using it"
-                        )
+                        recommendations.append("Close the file or application that's using it")
                         break
 
         else:

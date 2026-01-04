@@ -2,8 +2,9 @@
 Tests for adaptive fixing engine module.
 """
 
-import pytest
 from unittest.mock import MagicMock, Mock
+
+import pytest
 
 from jarvis.adaptive_fixing import AdaptiveFixEngine
 from jarvis.execution_models import CodeStep, FailureDiagnosis
@@ -43,7 +44,11 @@ def test_initialization(fix_engine):
 def test_diagnose_failure_import_error(fix_engine, sample_step, mock_llm_client):
     """Test diagnosing an ImportError."""
     mock_llm_client.generate = Mock(
-        return_value='{"root_cause": "Missing requests library", "suggested_fix": "Install requests", "fix_strategy": "install_package", "confidence": 0.9}'
+        return_value=(
+            '{"root_cause": "Missing requests library", '
+            '"suggested_fix": "Install requests", '
+            '"fix_strategy": "install_package", "confidence": 0.9}'
+        )
     )
 
     diagnosis = fix_engine.diagnose_failure(
@@ -64,7 +69,11 @@ def test_diagnose_failure_import_error(fix_engine, sample_step, mock_llm_client)
 def test_diagnose_failure_syntax_error(fix_engine, sample_step, mock_llm_client):
     """Test diagnosing a SyntaxError."""
     mock_llm_client.generate = Mock(
-        return_value='{"root_cause": "Invalid syntax", "suggested_fix": "Fix syntax", "fix_strategy": "regenerate_code", "confidence": 0.95}'
+        return_value=(
+            '{"root_cause": "Invalid syntax", '
+            '"suggested_fix": "Fix syntax", '
+            '"fix_strategy": "regenerate_code", "confidence": 0.95}'
+        )
     )
 
     diagnosis = fix_engine.diagnose_failure(
@@ -82,9 +91,7 @@ def test_diagnose_failure_syntax_error(fix_engine, sample_step, mock_llm_client)
 
 def test_generate_fix(fix_engine, sample_step, mock_llm_client):
     """Test generating a fix."""
-    mock_llm_client.generate = Mock(
-        return_value="# Fixed code\nimport requests\nprint('Hello')"
-    )
+    mock_llm_client.generate = Mock(return_value="# Fixed code\nimport requests\nprint('Hello')")
 
     diagnosis = FailureDiagnosis(
         error_type="ImportError",
@@ -95,9 +102,7 @@ def test_generate_fix(fix_engine, sample_step, mock_llm_client):
         confidence=0.9,
     )
 
-    fixed_code = fix_engine.generate_fix(
-        step=sample_step, diagnosis=diagnosis, retry_count=0
-    )
+    fixed_code = fix_engine.generate_fix(step=sample_step, diagnosis=diagnosis, retry_count=0)
 
     assert fixed_code is not None
     assert "import requests" in fixed_code or len(fixed_code) > 0
@@ -107,7 +112,7 @@ def test_retry_step_with_fix_success(fix_engine, sample_step):
     """Test retrying a step with successful fix."""
     fixed_code = "print('Fixed!')"
     success, output, error = fix_engine.retry_step_with_fix(
-        step=sample_step, fixed_code=fixed_code, max_retries=3
+        step=sample_step, fixed_code=fixed_code, max_retries=10
     )
 
     assert success is True
@@ -120,7 +125,7 @@ def test_retry_step_with_fix_failure(fix_engine, sample_step):
     fixed_code = "raise Exception('Still broken')"
 
     success, output, error = fix_engine.retry_step_with_fix(
-        step=sample_step, fixed_code=fixed_code, max_retries=3
+        step=sample_step, fixed_code=fixed_code, max_retries=10
     )
 
     assert success is False

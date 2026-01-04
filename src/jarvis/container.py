@@ -198,7 +198,7 @@ class Container:
             # Extract execution config for verification and retry settings
             enable_verification = True
             enable_retry = True
-            max_retries = 3
+            max_retries = 10
 
             try:
                 config_dict = config.model_dump()
@@ -206,7 +206,7 @@ class Container:
                     exec_config = config_dict["execution"]
                     enable_verification = exec_config.get("enable_verification", True)
                     enable_retry = exec_config.get("enable_retry", True)
-                    max_retries = exec_config.get("max_retries", 3)
+                    max_retries = exec_config.get("max_retries", 10)
             except Exception:
                 pass
 
@@ -415,7 +415,9 @@ class Container:
             self._dual_model_manager = DualModelManager(config=config)
         return self._dual_model_manager
 
-    def get_dual_execution_orchestrator(self, config_path: Optional[str] = None) -> DualExecutionOrchestrator:
+    def get_dual_execution_orchestrator(
+        self, config_path: Optional[str] = None
+    ) -> DualExecutionOrchestrator:
         """
         Get or create the dual execution orchestrator.
 
@@ -429,4 +431,3 @@ class Container:
             llm_client = self.get_llm_client(config_path=config_path)
             self._dual_execution_orchestrator = DualExecutionOrchestrator(llm_client=llm_client)
         return self._dual_execution_orchestrator
-

@@ -31,7 +31,7 @@ class Orchestrator:
         system_action_router: Optional[Any] = None,
         enable_verification: bool = True,
         enable_retry: bool = True,
-        max_retries: int = 3,
+        max_retries: int = 10,
     ) -> None:
         """
         Initialize the orchestrator.

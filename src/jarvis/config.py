@@ -141,7 +141,9 @@ class ExecutionConfig(BaseModel):
     enable_retry: bool = Field(
         default=True, description="Enable retry with fallback strategies on failure"
     )
-    max_retries: int = Field(default=3, ge=1, le=10, description="Maximum number of retry attempts")
+    max_retries: int = Field(
+        default=10, ge=1, le=10, description="Maximum number of retry attempts"
+    )
 
 
 class OCRConfig(BaseModel):
