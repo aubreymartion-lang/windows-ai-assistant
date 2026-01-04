@@ -30,6 +30,7 @@ src/jarvis/orchestrator.py
 src/jarvis/persistent_memory.py
 src/jarvis/reasoning.py
 src/jarvis/response_generator.py
+src/jarvis/retry_parsing.py
 src/jarvis/sqlite_backend.py
 src/jarvis/storage_backend.py
 src/jarvis/tool_teaching.py
@@ -48,3 +49,4 @@ tests/test_dual_execution_orchestrator.py
 tests/test_execution_monitor_windows.py
 tests/test_execution_router.py
 tests/test_execution_verifier.py
+tests/test_retry_parsing.py

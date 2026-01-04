@@ -113,7 +113,7 @@ class ExecutionMonitor:
 
         except subprocess.TimeoutExpired:
             logger.warning(f"Subprocess execution timeout after {timeout}s")
-            yield ("", "error", True)
+            yield (f"Execution timed out after {timeout} seconds", "error", True)
         except Exception as e:
             logger.error(f"Error executing subprocess: {e}", exc_info=True)
             yield (f"Execution error: {str(e)}", "error", True)

@@ -15,6 +15,7 @@ from typing import Generator, Optional
 
 from jarvis.llm_client import LLMClient
 from jarvis.mistake_learner import MistakeLearner
+from jarvis.retry_parsing import format_attempt_progress, parse_retry_limit
 from jarvis.utils import clean_code
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ class DirectExecutor:
                 cleaned_code = self._ensure_desktop_save(cleaned_code, user_request)
 
             logger.debug(f"Generated code length: {len(cleaned_code)} characters")
-            return cleaned_code
+            return str(cleaned_code)
         except Exception as e:
             logger.error(f"Failed to generate code: {e}")
             raise
@@ -185,44 +186,137 @@ class DirectExecutor:
             yield f"\n❌ Error: {str(e)}"
 
     def execute_request(
-        self, user_request: str, language: str = "python", timeout: int = 30
+        self,
+        user_request: str,
+        language: str = "python",
+        timeout: int = 30,
+        max_attempts: Optional[int] = None,
     ) -> Generator[str, None, None]:
-        """
-        Execute a user request end-to-end.
+        """Execute a user request end-to-end.
 
-        Args:
-            user_request: User's natural language request
-            language: Programming language (default: python)
-            timeout: Execution timeout in seconds
-
-        Yields:
-            Status updates and output as execution progresses
+        Retries indefinitely by default (per-attempt timeout still applies). If the
+        user specifies a max attempt limit, that limit is respected.
         """
-        yield "📝 Generating code...\n"
+
         logger.info(f"Executing request: {user_request}")
 
+        if max_attempts is None:
+            max_attempts = parse_retry_limit(user_request)
+
+        attempt = 1
+        code: Optional[str] = None
+        last_error_output = ""
+
+        # Keep a stable filename so retries overwrite the previous attempt rather than
+        # producing many temp files.
+        timestamp = int(time.time())
+        filename = f"jarvis_script_{timestamp}.py"
+
+        while True:
+            if max_attempts is not None and attempt > max_attempts:
+                yield f"\n❌ Max retries ({max_attempts}) exceeded, aborting\n"
+                return
+
+            progress = format_attempt_progress(attempt, max_attempts)
+
+            try:
+                if attempt == 1:
+                    yield f"📝 Generating code... ({progress})\n"
+                    code = self.generate_code(user_request, language)
+                else:
+                    yield f"📝 Fixing code... ({progress})\n"
+                    code = self._generate_fix_code(
+                        user_request=user_request,
+                        previous_code=code or "",
+                        error_output=last_error_output,
+                        language=language,
+                        attempt=attempt,
+                    )
+
+                yield "   ✓ Code generated\n\n"
+
+                yield "📄 Writing to file...\n"
+                script_path = self.write_execution_script(code, filename=filename)
+                yield f"   ✓ Written to {script_path}\n\n"
+
+                yield f"▶️ Executing script... ({progress})\n\n"
+                exit_code, combined_output = self._run_script_capture(script_path, timeout)
+
+                if combined_output:
+                    for line in combined_output.splitlines(keepends=True):
+                        yield line
+
+                if exit_code == 0:
+                    yield "\n\n✅ Execution complete\n"
+                    return
+
+                last_error_output = combined_output or f"Process exited with code {exit_code}"
+                yield f"\n❌ Script failed ({progress})\n"
+
+            except Exception as e:
+                last_error_output = str(e)
+                yield f"\n❌ Error ({progress}): {str(e)}\n"
+
+            attempt += 1
+
+    def _run_script_capture(self, script_path: Path, timeout: int) -> tuple[int, str]:
+        """Run a script and return (exit_code, combined_output)."""
+
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+
         try:
-            # Generate code
-            code = self.generate_code(user_request, language)
-            yield "   ✓ Code generated\n\n"
+            process = subprocess.run(
+                [sys.executable, str(script_path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                creationflags=creation_flags,
+            )
 
-            # Write to file
-            yield "📄 Writing to file...\n"
-            script_path = self.write_execution_script(code)
-            yield f"   ✓ Written to {script_path}\n\n"
+            combined = ""
+            if process.stdout:
+                combined += process.stdout
+            if process.stderr:
+                combined += process.stderr
 
-            # Execute and stream output
-            yield "▶️ Executing script...\n"
-            yield "\n"
+            return process.returncode, combined
+        except subprocess.TimeoutExpired:
+            return 124, f"Execution timed out after {timeout} seconds"
 
-            for output_line in self.stream_execution(script_path, timeout):
-                yield output_line
+    def _generate_fix_code(
+        self,
+        user_request: str,
+        previous_code: str,
+        error_output: str,
+        language: str,
+        attempt: int,
+    ) -> str:
+        prompt = f"""The following {language} script failed.
 
-            yield "\n\n✅ Execution complete\n"
+User request:
+{user_request}
 
-        except Exception as e:
-            logger.error(f"Failed to execute request: {e}")
-            yield f"\n❌ Error: {str(e)}\n"
+Previous code:
+```{language}
+{previous_code}
+```
+
+Error/output:
+{error_output}
+
+Please produce a corrected, complete, executable {language} script.
+
+Requirements:
+- Fix the failure based on the error/output
+- Add error handling and make it robust
+- Return ONLY the code (no markdown, no explanation)
+
+This is attempt #{attempt}."""
+
+        raw_code = self.llm_client.generate(prompt)
+        return str(clean_code(str(raw_code)))
 
     def _detect_desktop_save_request(self, user_request: str) -> bool:
         """

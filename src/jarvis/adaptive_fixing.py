@@ -6,14 +6,20 @@ re-running successful ones.
 """
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TypedDict
 
 from jarvis.execution_models import CodeStep, FailureDiagnosis
 from jarvis.llm_client import LLMClient
 from jarvis.mistake_learner import LearningPattern, MistakeLearner
+from jarvis.retry_parsing import format_attempt_progress
 from jarvis.utils import clean_code
 
 logger = logging.getLogger(__name__)
+
+
+class RetryHistoryEntry(TypedDict):
+    count: int
+    last_fix_strategy: Optional[str]
 
 
 class AdaptiveFixEngine:
@@ -41,9 +47,9 @@ class AdaptiveFixEngine:
         """
         self.llm_client = llm_client
         self.mistake_learner = mistake_learner or MistakeLearner()
-        self.max_retries = 10  # Increased retry limit
-        self.retry_history = {}
-        logger.info("AdaptiveFixEngine initialized with max_retries=10")
+        self.default_max_retries: Optional[int] = None
+        self.retry_history: dict[str, RetryHistoryEntry] = {}
+        logger.info("AdaptiveFixEngine initialized with unlimited retries by default")
 
     def diagnose_failure(
         self,
@@ -124,7 +130,7 @@ class AdaptiveFixEngine:
             # Clean markdown formatting from generated code
             fixed_code = clean_code(str(raw_code))
             logger.debug(f"Generated fix length: {len(fixed_code)} characters")
-            return fixed_code
+            return str(fixed_code)
         except Exception as e:
             logger.error(f"Failed to generate fix: {e}")
             raise
@@ -154,24 +160,28 @@ class AdaptiveFixEngine:
         except Exception as e:
             logger.warning(f"Failed to save learning pattern: {e}")
 
-    def should_abort_retry(self, step_number: int, error_type: str, retry_count: int) -> bool:
-        """
-        Determine if we should abort retry attempts.
+    def should_abort_retry(
+        self,
+        step_number: int,
+        error_type: str,
+        retry_count: int,
+        max_retries: Optional[int] = None,
+    ) -> bool:
+        """Determine if we should abort retry attempts.
 
-        Args:
-            step_number: Current step number
-            error_type: Type of error
-            retry_count: Current retry attempt
-
-        Returns:
-            True if should abort
+        If max_retries is None, retries are unlimited and this returns False.
         """
+
+        effective_max = self.default_max_retries if max_retries is None else max_retries
+        if effective_max is None:
+            return False
+
         # Abort if retry count exceeds max
-        if retry_count >= self.max_retries:
-            logger.warning(f"Max retries ({self.max_retries}) exceeded for step {step_number}")
+        if retry_count >= effective_max:
+            logger.warning(f"Max retries ({effective_max}) exceeded for step {step_number}")
             return True
 
-        # Track repeated errors
+        # Track repeated errors (only in bounded mode)
         key = f"{step_number}:{error_type}"
         if key not in self.retry_history:
             self.retry_history[key] = {"count": 0, "last_fix_strategy": None}
@@ -243,77 +253,92 @@ class AdaptiveFixEngine:
         return tags
 
     def retry_step_with_fix(
-        self, step: CodeStep, fixed_code: str, max_retries: int = 10
+        self,
+        step: CodeStep,
+        fixed_code: str,
+        max_retries: Optional[int] = None,
     ) -> Tuple[bool, str, Optional[str]]:
-        """
-        Execute fixed code and check if it passes.
-
-        Uses subprocess.run() for Windows compatibility, avoiding WinError 10038.
+        """Execute fixed code and retry until success or max attempts.
 
         Args:
-            step: CodeStep with updated code
-            fixed_code: Fixed code to execute
-            max_retries: Maximum retry attempts
+            step: CodeStep to retry
+            fixed_code: The fixed code to execute
+            max_retries: Max attempts (None = unlimited). Timeout still applies per attempt.
 
         Returns:
             Tuple of (success, output, error_if_failed)
         """
-        logger.info(f"Retrying step {step.step_number} with fix")
 
         import os
         import subprocess
         import sys
         import tempfile
 
-        # Write fixed code to temp file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(fixed_code)
-            temp_file = f.name
+        attempt = 1
+        last_output = ""
 
-        try:
-            creation_flags = 0
-            if sys.platform == "win32":
-                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        while True:
+            if max_retries is not None and attempt > max_retries:
+                error_msg = f"Max {max_retries} attempts exceeded"
+                logger.warning(
+                    "Max user-specified retries (%s) exceeded for step %s",
+                    max_retries,
+                    step.step_number,
+                )
+                return False, last_output, error_msg
 
-            # Execute fixed code using subprocess.run() for better Windows compatibility
-            logger.info(
-                f"AdaptiveFixEngine: Calling subprocess.run with creationflags={creation_flags}"
-            )
-            process = subprocess.run(
-                [sys.executable, temp_file],
-                capture_output=True,
-                text=True,
-                timeout=step.timeout_seconds,
-                creationflags=creation_flags,
-            )
+            progress = format_attempt_progress(attempt, max_retries)
+            logger.info(f"Step {step.step_number}: {progress}")
 
-            output = ""
-            if process.stdout:
-                output += process.stdout
-            if process.stderr:
-                output += process.stderr
+            # Write fixed code to temp file for this attempt
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+                f.write(fixed_code)
+                temp_file = f.name
 
-            if process.returncode == 0:
-                logger.info(f"Retry successful for step {step.step_number}")
-                return True, output, None
-            else:
-                logger.warning(f"Retry failed for step {step.step_number}: {output[:200]}")
-                return False, output, output
-
-        except subprocess.TimeoutExpired:
-            error_msg = f"Retry timed out after {step.timeout_seconds} seconds"
-            logger.error(error_msg)
-            return False, "", error_msg
-        except Exception as e:
-            error_msg = f"Retry failed with exception: {str(e)}"
-            logger.error(error_msg)
-            return False, "", error_msg
-        finally:
-            # Clean up temp file
             try:
-                os.unlink(temp_file)
-            except Exception:
-                pass
+                creation_flags = 0
+                if sys.platform == "win32":
+                    creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+                process = subprocess.run(
+                    [sys.executable, temp_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=step.timeout_seconds,
+                    creationflags=creation_flags,
+                )
+
+                output = ""
+                if process.stdout:
+                    output += process.stdout
+                if process.stderr:
+                    output += process.stderr
+
+                last_output = output
+
+                if process.returncode == 0:
+                    logger.info(f"Step {step.step_number} succeeded on {progress}")
+                    return True, output, None
+
+                logger.warning(f"Step {step.step_number} failed on {progress}: {output[:200]}")
+
+                attempt += 1
+                continue
+
+            except subprocess.TimeoutExpired:
+                error_msg = f"Timeout after {step.timeout_seconds} seconds"
+                logger.error(f"Step {step.step_number} timeout on {progress}")
+                return False, last_output, error_msg
+            except Exception as e:
+                last_output = str(e)
+                logger.error(f"Step {step.step_number} error on {progress}: {e}")
+                attempt += 1
+                continue
+            finally:
+                try:
+                    os.unlink(temp_file)
+                except Exception:
+                    pass
 
     def _build_diagnosis_prompt(
         self,

@@ -7,7 +7,6 @@ dependencies and validation methods.
 
 import json
 import logging
-import re
 from typing import List, Optional
 
 from jarvis.execution_models import CodeStep
@@ -143,7 +142,7 @@ class CodeStepBreakdown:
         logger.debug(f"Breakdown prompt length: {len(prompt)} characters")
 
         try:
-            response = self.llm_client.generate(prompt)
+            response = str(self.llm_client.generate(prompt))
             logger.debug(f"Breakdown response received: {len(response)} characters")
             return response
         except Exception as e:
@@ -174,7 +173,7 @@ Respond with valid JSON:
       "expected_output_pattern": "regex pattern (if validation_method is output_pattern)",
       "dependencies": [],
       "timeout_seconds": 30,
-      "max_retries": 3
+      "max_retries": null
     }}
   ]
 }}
@@ -184,6 +183,7 @@ Notes:
 - Dependencies should reference earlier step numbers only
 - Informational steps (prepare, format, reply) should have is_code_execution=false
 - Code steps should have is_code_execution=true
+- max_retries can be a number or null (null means unlimited retries)
 - Keep descriptions clear and actionable
 
 Return only valid JSON, no other text."""
@@ -222,7 +222,7 @@ Return only valid JSON, no other text."""
                         expected_output_pattern=step_data.get("expected_output_pattern"),
                         dependencies=step_data.get("dependencies", []),
                         timeout_seconds=step_data.get("timeout_seconds", 30),
-                        max_retries=step_data.get("max_retries", 10),
+                        max_retries=self._sanitize_max_retries(step_data.get("max_retries")),
                         status="pending",
                     )
                     steps.append(step)
@@ -238,6 +238,29 @@ Return only valid JSON, no other text."""
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning(f"Failed to parse breakdown JSON: {e}")
             return self._create_simple_step(user_request)
+
+    def _sanitize_max_retries(self, value: object) -> Optional[int]:
+        if value is None:
+            return None
+
+        # Prevent bool from being treated as int
+        if isinstance(value, bool):
+            return None
+
+        if isinstance(value, int):
+            n = value
+        elif isinstance(value, str):
+            try:
+                n = int(value.strip())
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if n <= 0:
+            return None
+
+        return n
 
     def _validate_steps(self, steps: List[CodeStep]) -> List[CodeStep]:
         """

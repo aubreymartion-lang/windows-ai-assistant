@@ -6,7 +6,7 @@ execution monitor, and adaptive fixing engine.
 """
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,7 +34,9 @@ class CodeStep(BaseModel):
         default="output_pattern",
         description="Validation method: output_pattern, file_exists, syntax_check, manual",
     )
-    max_retries: int = Field(default=10, description="Maximum retry attempts")
+    max_retries: Optional[int] = Field(
+        default=None, description="Maximum retry attempts (None = unlimited)"
+    )
     timeout_seconds: int = Field(default=30, description="Step timeout in seconds")
     status: str = Field(
         default="pending", description="Step status: pending, running, completed, failed"

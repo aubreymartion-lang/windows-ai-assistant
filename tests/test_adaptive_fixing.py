@@ -112,7 +112,7 @@ def test_retry_step_with_fix_success(fix_engine, sample_step):
     """Test retrying a step with successful fix."""
     fixed_code = "print('Fixed!')"
     success, output, error = fix_engine.retry_step_with_fix(
-        step=sample_step, fixed_code=fixed_code, max_retries=10
+        step=sample_step, fixed_code=fixed_code, max_retries=2
     )
 
     assert success is True
@@ -125,8 +125,9 @@ def test_retry_step_with_fix_failure(fix_engine, sample_step):
     fixed_code = "raise Exception('Still broken')"
 
     success, output, error = fix_engine.retry_step_with_fix(
-        step=sample_step, fixed_code=fixed_code, max_retries=10
+        step=sample_step, fixed_code=fixed_code, max_retries=2
     )
 
     assert success is False
-    assert error is not None or "Still broken" in output
+    assert error is not None
+    assert "Still broken" in output or "Max 2 attempts" in error

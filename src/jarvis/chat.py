@@ -17,6 +17,7 @@ from jarvis.intent_classifier import IntentClassifier
 from jarvis.orchestrator import Orchestrator
 from jarvis.reasoning import Plan, ReasoningModule
 from jarvis.response_generator import ResponseGenerator
+from jarvis.retry_parsing import parse_retry_limit
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +259,7 @@ class ChatSession:
 
             # Generate appropriate response
             response = self.response_generator.generate_response(intent, result_str, user_input)
-            return response
+            return str(response)
 
         except Exception as e:
             logger.warning(f"Failed to generate conversational response: {e}")
@@ -372,8 +373,12 @@ class ChatSession:
         """
         logger.info(f"Processing user input with streaming: {user_input}")
 
+        max_attempts = parse_retry_limit(user_input)
+
         context = self.get_context_summary()
-        self.add_message("user", user_input, metadata={"context": context})
+        self.add_message(
+            "user", user_input, metadata={"context": context, "max_attempts": max_attempts}
+        )
 
         full_response_parts = []
 
@@ -401,7 +406,9 @@ class ChatSession:
                 if has_code_keyword:
                     logger.debug("Using dual execution orchestrator for code execution")
                     try:
-                        for chunk in self.dual_execution_orchestrator.process_request(user_input):
+                        for chunk in self.dual_execution_orchestrator.process_request(
+                            user_input, max_attempts=max_attempts
+                        ):
                             yield chunk
                             full_response_parts.append(chunk)
 
