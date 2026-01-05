@@ -72,7 +72,7 @@ class ExecutorLLMConfig(BaseModel):
 
     provider: str = Field(default="ollama", description="LLM provider (e.g., ollama, local)")
     model: str = Field(
-        default="llama3.1:8b",
+        default="deepseek-coder:33b-instruct-q4_K_M",
         description="Model name for execution (LLaMA 3.1 8B/12B recommended)",
     )
     base_url: Optional[str] = Field(
