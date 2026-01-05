@@ -14,6 +14,7 @@ import customtkinter
 
 from jarvis.chat import ChatMessage, ChatSession
 from jarvis.config import JarvisConfig
+from jarvis.gui.sandbox_viewer import SandboxViewer
 from jarvis.intent_classifier import IntentClassifier
 from jarvis.orchestrator import Orchestrator
 from jarvis.persistent_memory import MemoryModule
@@ -34,6 +35,7 @@ class GUIApp(customtkinter.CTk):
         voice_callback: Optional[Callable[[str], None]] = None,
         dual_execution_orchestrator: Optional[Any] = None,
         memory_module: Optional[MemoryModule] = None,
+        sandbox_debug_mode: bool = False,
     ) -> None:
         """
         Initialize the GUI application.
@@ -44,6 +46,8 @@ class GUIApp(customtkinter.CTk):
             config: Optional configuration
             voice_callback: Optional callback for voice input
             dual_execution_orchestrator: Optional dual execution orchestrator for code execution
+            memory_module: Optional memory module for persistent conversation
+            sandbox_debug_mode: Enable sandbox viewer debug mode
         """
         super().__init__()
 
@@ -53,6 +57,7 @@ class GUIApp(customtkinter.CTk):
         self.voice_callback = voice_callback
         self.dual_execution_orchestrator = dual_execution_orchestrator
         self.memory_module = memory_module
+        self.sandbox_debug_mode = sandbox_debug_mode
 
         # Initialize intent classifier and response generator
         self.intent_classifier = IntentClassifier()
@@ -75,7 +80,7 @@ class GUIApp(customtkinter.CTk):
 
         # Configure window
         self.title("Jarvis AI Assistant")
-        self.geometry("1200x800")
+        self.geometry("1200x900")
 
         # Set theme
         theme = "dark"
@@ -91,9 +96,9 @@ class GUIApp(customtkinter.CTk):
 
     def _setup_ui(self) -> None:
         """Set up the user interface layout."""
-        # Main container
-        main_frame = customtkinter.CTkFrame(self)
-        main_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        # Main container - split into chat area (top) and sandbox viewer (bottom)
+        self.main_frame = customtkinter.CTkFrame(self)
+        self.main_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
 
         # Sidebar
         sidebar_frame = customtkinter.CTkFrame(self, width=250, corner_radius=10)
@@ -138,15 +143,15 @@ class GUIApp(customtkinter.CTk):
         self.actions_text.configure(state="disabled")
 
         # Chat area
-        chat_title = customtkinter.CTkLabel(main_frame, text="Chat", font=("Arial", 14, "bold"))
+        chat_title = customtkinter.CTkLabel(self.main_frame, text="Chat", font=("Arial", 14, "bold"))
         chat_title.pack(pady=5)
 
-        self.chat_text = customtkinter.CTkTextbox(main_frame, text_color="white")
+        self.chat_text = customtkinter.CTkTextbox(self.main_frame, text_color="white")
         self.chat_text.pack(fill="both", expand=True, pady=5)
         self.chat_text.configure(state="disabled")
 
         # Plan/Execution status
-        status_frame = customtkinter.CTkFrame(main_frame)
+        status_frame = customtkinter.CTkFrame(self.main_frame)
         status_frame.pack(pady=5, fill="x")
 
         self.plan_status = customtkinter.CTkLabel(
@@ -159,8 +164,18 @@ class GUIApp(customtkinter.CTk):
         )
         self.exec_status.pack(side="left", padx=5)
 
+        # Sandbox viewer toggle button
+        self.sandbox_toggle_button = customtkinter.CTkButton(
+            status_frame,
+            text="📊 Show Sandbox Viewer",
+            command=self._toggle_sandbox_viewer,
+            width=150,
+            font=("Arial", 10)
+        )
+        self.sandbox_toggle_button.pack(side="right", padx=5)
+
         # Input area
-        input_frame = customtkinter.CTkFrame(main_frame)
+        input_frame = customtkinter.CTkFrame(self.main_frame)
         input_frame.pack(pady=5, fill="x")
 
         self.input_text = customtkinter.CTkEntry(
@@ -183,6 +198,38 @@ class GUIApp(customtkinter.CTk):
             input_frame, text="Cancel", command=self._cancel_command, width=80, state="disabled"
         )
         self.cancel_button.pack(side="left", padx=5)
+
+        # Sandbox viewer (initially hidden)
+        self.sandbox_frame = customtkinter.CTkFrame(self.main_frame, fg_color=("#1E1E1E", "#111111"))
+        self.sandbox_frame.pack(fill="both", expand=True, padx=5, pady=(5, 0))
+        self.sandbox_frame.pack_forget()  # Initially hidden
+
+        self.sandbox_viewer = SandboxViewer(
+            self.sandbox_frame,
+            debug_mode=self.sandbox_debug_mode
+        )
+        self.sandbox_viewer.pack(fill="both", expand=True)
+
+    def _toggle_sandbox_viewer(self) -> None:
+        """Toggle sandbox viewer visibility."""
+        if self.sandbox_frame.winfo_viewable():
+            self.sandbox_frame.pack_forget()
+            self.sandbox_toggle_button.configure(text="📊 Show Sandbox Viewer")
+        else:
+            self.sandbox_frame.pack(fill="both", expand=True, padx=5, pady=(5, 0))
+            self.sandbox_toggle_button.configure(text="📊 Hide Sandbox Viewer")
+
+    def get_gui_callback(self) -> Callable[[str, dict], None]:
+        """
+        Return callback for sandbox execution system.
+
+        Returns:
+            Callback function that routes events to sandbox viewer
+        """
+        def callback(event_type: str, data: dict) -> None:
+            if hasattr(self, 'sandbox_viewer'):
+                self.sandbox_viewer.handle_gui_callback(event_type, data)
+        return callback
 
     def _send_command(self) -> None:
         """Send the input command for processing."""
@@ -345,6 +392,7 @@ def create_gui_app(
     voice_callback: Optional[Callable[[str], None]] = None,
     dual_execution_orchestrator: Optional[Any] = None,
     memory_module: Optional[MemoryModule] = None,
+    sandbox_debug_mode: bool = False,
 ) -> GUIApp:
     """
     Create and return a GUI application instance.
@@ -356,6 +404,7 @@ def create_gui_app(
         voice_callback: Optional callback for voice input
         dual_execution_orchestrator: Optional dual execution orchestrator for code execution
         memory_module: Optional memory module for persistent conversation and execution tracking
+        sandbox_debug_mode: Enable sandbox viewer debug mode
 
     Returns:
         Configured GUIApp instance
@@ -367,4 +416,5 @@ def create_gui_app(
         voice_callback=voice_callback,
         dual_execution_orchestrator=dual_execution_orchestrator,
         memory_module=memory_module,
+        sandbox_debug_mode=sandbox_debug_mode,
     )

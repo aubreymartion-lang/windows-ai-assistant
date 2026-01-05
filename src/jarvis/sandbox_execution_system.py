@@ -114,13 +114,17 @@ class SandboxExecutionSystem:
             sandbox.update_state(SandboxState.GENERATING)
             self._notify_gui(gui_callback, "sandbox_created", {"sandbox_id": sandbox.sandbox_id})
 
+            # Notify step progress
+            self._notify_gui(gui_callback, "step_progress", {"step": 1, "total": 7, "description": "Creating sandbox"})
+
             # Retry loop
             for attempt in range(max_retries):
                 result["retry_count"] = attempt + 1
-                self._notify_gui(gui_callback, "retry_attempt", {"attempt": attempt + 1})
+                self._notify_gui(gui_callback, "retry_attempt", {"attempt": attempt + 1, "max_attempts": max_retries})
 
                 # Step 2: Generate code with learned patterns
-                code = self._generate_code(user_request, language, log_id)
+                self._notify_gui(gui_callback, "code_generation_started", {})
+                code = self._generate_code(user_request, language, log_id, gui_callback)
 
                 if not code:
                     logger.warning(f"Attempt {attempt + 1}: Generated empty code, retrying")
@@ -185,7 +189,11 @@ class SandboxExecutionSystem:
         return result
 
     def _generate_code(
-        self, user_request: str, language: str, log_id: Optional[str]
+        self,
+        user_request: str,
+        language: str,
+        log_id: Optional[str],
+        gui_callback: Optional[callable] = None,
     ) -> Optional[str]:
         """
         Generate code using LLM with learned patterns.
@@ -194,6 +202,7 @@ class SandboxExecutionSystem:
             user_request: User request
             language: Programming language
             log_id: Debug log ID
+            gui_callback: Optional GUI callback
 
         Returns:
             Generated code or None if empty
@@ -210,11 +219,23 @@ class SandboxExecutionSystem:
             if self.debugger.enabled:
                 self.debugger.log_code_generation(raw_code, user_request, log_id)
 
-            # Clean code
-            cleaned_code = self.code_cleaner.clean_code(raw_code)
+            # Clean code (which now includes prompt injection)
+            cleaned_code = self.code_cleaner.clean_code(raw_code, log_id)
+
+            # Notify about prompts injected
+            from jarvis.prompt_injector import PromptInjector
+            injector = PromptInjector()
+            input_count = injector.count_input_calls(cleaned_code)
 
             if self.debugger.enabled:
                 self.debugger.log_code_cleaning(raw_code, cleaned_code, log_id)
+
+            self._notify_gui(gui_callback, "code_generated", {"code": cleaned_code})
+            self._notify_gui(gui_callback, "code_generation_complete", {})
+            self._notify_gui(gui_callback, "prompts_injected", {
+                "count": input_count,
+                "code_preview": cleaned_code[:200]
+            })
 
             return cleaned_code
 
@@ -291,10 +312,20 @@ Requirements:
             code=script_path.read_text(),
         )
 
-        self._notify_gui(gui_callback, "test_cases_generated", {"count": len(test_cases)})
+        self._notify_gui(gui_callback, "test_cases_generated", {
+            "count": len(test_cases),
+            "tests": test_cases
+        })
+
+        # Notify test execution started
+        self._notify_gui(gui_callback, "test_execution_started", {})
 
         # Execute tests
-        results = self.interactive_executor.execute_all_tests(script_path, test_cases)
+        results = self.interactive_executor.execute_all_tests(
+            script_path,
+            test_cases,
+            gui_callback
+        )
 
         # Log results
         for i, result in enumerate(results, 1):
@@ -302,6 +333,12 @@ Requirements:
                 gui_callback,
                 "test_result",
                 {"test_num": i, "result": result},
+            )
+
+            self._notify_gui(
+                gui_callback,
+                "test_completed",
+                {"test_name": result["test_name"], "result": result},
             )
 
             if self.debugger.enabled:

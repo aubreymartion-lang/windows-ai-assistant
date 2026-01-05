@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
+from jarvis.prompt_injector import PromptInjector
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +73,14 @@ class CodeCleaner:
             for issue in issues:
                 logger.warning(f"Code issue detected: {issue}")
             self._log_issues(issues, log_id)
+
+        # Inject prompts for interactive programs
+        injector = PromptInjector()
+        input_count = injector.count_input_calls(cleaned)
+        if input_count > 0:
+            logger.info(f"Injecting prompts into {input_count} input() calls")
+            cleaned = injector.inject_prompts(cleaned, log_id)
+            self._log_code(cleaned, "after_prompt_injection", log_id)
 
         # Return cleaned code
         self._log_code(cleaned, "final", log_id)

@@ -42,6 +42,7 @@ class InteractiveExecutor:
         script_path: Path,
         inputs: List[str],
         test_name: str = "Test",
+        gui_callback: Optional[callable] = None,
     ) -> dict:
         """
         Execute an interactive program with given inputs.
@@ -50,6 +51,7 @@ class InteractiveExecutor:
             script_path: Path to Python script
             inputs: List of input strings to provide
             test_name: Name of the test case
+            gui_callback: Optional GUI callback for real-time updates
 
         Returns:
             Dictionary with execution results
@@ -61,6 +63,7 @@ class InteractiveExecutor:
         all_output = ""
         passed = False
         error = None
+        prompt_log = []  # Track prompts and inputs for GUI
 
         try:
             # Create subprocess
@@ -91,6 +94,7 @@ class InteractiveExecutor:
                 if elapsed_since_output > self.timeout and input_index >= len(inputs):
                     logger.warning(f"Timeout after {elapsed_since_output:.1f}s with no output")
                     process.kill()
+                    error = f"Timeout after {elapsed_since_output:.1f}s"
                     break
 
                 # Try to read output
@@ -106,6 +110,20 @@ class InteractiveExecutor:
                         current_output = "".join(output_lines)
                         if self._has_prompt(current_output) and input_index < len(inputs):
                             next_input = inputs[input_index] + "\n"
+
+                            # Log the prompt before sending input
+                            prompt = self._get_last_prompt(current_output)
+                            if prompt:
+                                prompt_log.append((prompt, inputs[input_index]))
+
+                            # Notify GUI of prompt and input
+                            if gui_callback:
+                                try:
+                                    gui_callback("prompt_detected", {"prompt": prompt})
+                                    gui_callback("input_sent", {"input": inputs[input_index]})
+                                except Exception:
+                                    pass
+
                             logger.debug(f"Sending input {input_index}: {inputs[input_index]!r}")
                             process.stdin.write(next_input)
                             process.stdin.flush()
@@ -145,6 +163,7 @@ class InteractiveExecutor:
             "elapsed_time": time.time() - start_time,
             "passed": passed,
             "error": error,
+            "prompt_log": prompt_log,  # Track prompts for GUI
         }
 
     def _has_prompt(self, output: str) -> bool:
@@ -180,10 +199,58 @@ class InteractiveExecutor:
 
         return False
 
+    def _get_last_prompt(self, output: str) -> str:
+        """
+        Extract the last prompt from output.
+
+        Args:
+            output: Output text so far
+
+        Returns:
+            The last prompt string, or empty string if no prompt found
+        """
+        # Look for the last line ending with a known prompt pattern
+        prompt_indicators = [
+            ": ",
+            "? ",
+            "> ",
+            "Enter ",
+            "Input ",
+            "Choose ",
+            "Select ",
+        ]
+
+        lines = output.strip().split("\n")
+        if not lines:
+            return ""
+
+        # Check the last line first
+        last_line = lines[-1]
+
+        for indicator in prompt_indicators:
+            if last_line.endswith(indicator):
+                return last_line
+
+        # If the last line doesn't have a complete prompt,
+        # check if the output ends with a partial prompt indicator
+        for indicator in prompt_indicators:
+            if output.rstrip().endswith(indicator):
+                # Find where this indicator starts and return from there
+                idx = output.rfind(indicator)
+                if idx != -1:
+                    return output[idx:].strip()
+
+        # Return the last line if it looks like it contains a prompt
+        if last_line.strip() and any(ind in last_line for ind in [":", "?", ">"]):
+            return last_line.strip()
+
+        return ""
+
     def execute_all_tests(
         self,
         script_path: Path,
         test_cases: List[dict],
+        gui_callback: Optional[callable] = None,
     ) -> List[dict]:
         """
         Execute all test cases for a script.
@@ -191,6 +258,7 @@ class InteractiveExecutor:
         Args:
             script_path: Path to Python script
             test_cases: List of test case dictionaries
+            gui_callback: Optional GUI callback for progress updates
 
         Returns:
             List of execution results
@@ -198,11 +266,32 @@ class InteractiveExecutor:
         results = []
 
         for test_case in test_cases:
+            # Notify test started
+            if gui_callback:
+                try:
+                    gui_callback("test_started", {
+                        "test_name": test_case.get("name", "Unnamed"),
+                        "test_num": len(results) + 1,
+                    })
+                except Exception:
+                    pass
+
             result = self.execute_interactive(
                 script_path=script_path,
                 inputs=test_case["inputs"],
                 test_name=test_case["name"],
+                gui_callback=gui_callback,
             )
+
+            # Notify prompt detected and input sent for each input
+            if gui_callback and result.get("prompt_log"):
+                for prompt, input_val in result["prompt_log"]:
+                    try:
+                        gui_callback("prompt_detected", {"prompt": prompt})
+                        if input_val:
+                            gui_callback("input_sent", {"input": input_val})
+                    except Exception:
+                        pass
 
             # Validate output if validation function provided
             if "validate" in test_case and not result["passed"]:
