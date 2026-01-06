@@ -8,16 +8,17 @@ plan/execution status badges, and integration with the voice interface.
 import logging
 import threading
 import tkinter as tk
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
 import customtkinter
 
-from jarvis.chat import ChatMessage, ChatSession
+from jarvis.chat import ChatSession
 from jarvis.config import JarvisConfig
+from jarvis.gui.sandbox_viewer import SandboxViewer
 from jarvis.intent_classifier import IntentClassifier
 from jarvis.orchestrator import Orchestrator
 from jarvis.persistent_memory import MemoryModule
-from jarvis.reasoning import Plan, ReasoningModule
+from jarvis.reasoning import ReasoningModule
 from jarvis.response_generator import ResponseGenerator
 
 logger = logging.getLogger(__name__)
@@ -31,9 +32,10 @@ class GUIApp(customtkinter.CTk):
         orchestrator: Orchestrator,
         reasoning_module: Optional[ReasoningModule] = None,
         config: Optional[JarvisConfig] = None,
-        voice_callback: Optional[Callable[[str], None]] = None,
+        voice_callback: Optional[Callable[[], None]] = None,
         dual_execution_orchestrator: Optional[Any] = None,
         memory_module: Optional[MemoryModule] = None,
+        sandbox_debug_mode: bool = False,
     ) -> None:
         """
         Initialize the GUI application.
@@ -44,6 +46,8 @@ class GUIApp(customtkinter.CTk):
             config: Optional configuration
             voice_callback: Optional callback for voice input
             dual_execution_orchestrator: Optional dual execution orchestrator for code execution
+            memory_module: Optional memory module for persistent conversation
+            sandbox_debug_mode: Enable sandbox viewer debug mode
         """
         super().__init__()
 
@@ -53,6 +57,7 @@ class GUIApp(customtkinter.CTk):
         self.voice_callback = voice_callback
         self.dual_execution_orchestrator = dual_execution_orchestrator
         self.memory_module = memory_module
+        self.sandbox_debug_mode = sandbox_debug_mode
 
         # Initialize intent classifier and response generator
         self.intent_classifier = IntentClassifier()
@@ -75,7 +80,7 @@ class GUIApp(customtkinter.CTk):
 
         # Configure window
         self.title("Jarvis AI Assistant")
-        self.geometry("1200x800")
+        self.geometry("1200x900")
 
         # Set theme
         theme = "dark"
@@ -91,9 +96,9 @@ class GUIApp(customtkinter.CTk):
 
     def _setup_ui(self) -> None:
         """Set up the user interface layout."""
-        # Main container
-        main_frame = customtkinter.CTkFrame(self)
-        main_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        # Main container - split into chat area (top) and sandbox viewer (bottom)
+        self.main_frame = customtkinter.CTkFrame(self)
+        self.main_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
 
         # Sidebar
         sidebar_frame = customtkinter.CTkFrame(self, width=250, corner_radius=10)
@@ -138,15 +143,17 @@ class GUIApp(customtkinter.CTk):
         self.actions_text.configure(state="disabled")
 
         # Chat area
-        chat_title = customtkinter.CTkLabel(main_frame, text="Chat", font=("Arial", 14, "bold"))
+        chat_title = customtkinter.CTkLabel(
+            self.main_frame, text="Chat", font=("Arial", 14, "bold")
+        )
         chat_title.pack(pady=5)
 
-        self.chat_text = customtkinter.CTkTextbox(main_frame, text_color="white")
+        self.chat_text = customtkinter.CTkTextbox(self.main_frame, text_color="white")
         self.chat_text.pack(fill="both", expand=True, pady=5)
         self.chat_text.configure(state="disabled")
 
         # Plan/Execution status
-        status_frame = customtkinter.CTkFrame(main_frame)
+        status_frame = customtkinter.CTkFrame(self.main_frame)
         status_frame.pack(pady=5, fill="x")
 
         self.plan_status = customtkinter.CTkLabel(
@@ -159,8 +166,18 @@ class GUIApp(customtkinter.CTk):
         )
         self.exec_status.pack(side="left", padx=5)
 
+        # Sandbox viewer toggle button
+        self.sandbox_toggle_button = customtkinter.CTkButton(
+            status_frame,
+            text="📊 Show Sandbox Viewer",
+            command=self._toggle_sandbox_viewer,
+            width=150,
+            font=("Arial", 10),
+        )
+        self.sandbox_toggle_button.pack(side="right", padx=5)
+
         # Input area
-        input_frame = customtkinter.CTkFrame(main_frame)
+        input_frame = customtkinter.CTkFrame(self.main_frame)
         input_frame.pack(pady=5, fill="x")
 
         self.input_text = customtkinter.CTkEntry(
@@ -183,6 +200,57 @@ class GUIApp(customtkinter.CTk):
             input_frame, text="Cancel", command=self._cancel_command, width=80, state="disabled"
         )
         self.cancel_button.pack(side="left", padx=5)
+
+        # Sandbox viewer (initially hidden)
+        self.sandbox_frame = customtkinter.CTkFrame(
+            self.main_frame, fg_color=("#1E1E1E", "#111111")
+        )
+        self.sandbox_frame.pack(fill="both", expand=True, padx=5, pady=(5, 0))
+        self.sandbox_frame.pack_forget()  # Initially hidden
+
+        self.sandbox_viewer = SandboxViewer(self.sandbox_frame, debug_mode=self.sandbox_debug_mode)
+        self.sandbox_viewer.pack(fill="both", expand=True)
+
+    def _toggle_sandbox_viewer(self) -> None:
+        """Toggle sandbox viewer visibility."""
+        if self.sandbox_frame.winfo_viewable():
+            self.sandbox_frame.pack_forget()
+            self.sandbox_toggle_button.configure(text="📊 Show Sandbox Viewer")
+        else:
+            self.sandbox_frame.pack(fill="both", expand=True, padx=5, pady=(5, 0))
+            self.sandbox_toggle_button.configure(text="📊 Hide Sandbox Viewer")
+
+    def _run_on_ui_thread(self, func: Callable[[], None]) -> None:
+        if threading.current_thread() is threading.main_thread():
+            func()
+            return
+
+        try:
+            self.after(0, func)
+        except RuntimeError:
+            logger.debug("Skipping UI update; GUI likely shutting down")
+
+    def get_gui_callback(self) -> Callable[[str, dict[str, Any]], None]:
+        """
+        Return callback for sandbox execution system.
+
+        Returns:
+            Callback function that routes events to sandbox viewer
+        """
+
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            if not hasattr(self, "sandbox_viewer"):
+                return
+
+            event_type_copy = event_type
+            data_copy: dict[str, Any] = dict(data)
+
+            def _dispatch() -> None:
+                self.sandbox_viewer.handle_gui_callback(event_type_copy, data_copy)
+
+            self._run_on_ui_thread(_dispatch)
+
+        return callback
 
     def _send_command(self) -> None:
         """Send the input command for processing."""
@@ -226,27 +294,44 @@ class GUIApp(customtkinter.CTk):
         """
         try:
             # Stream command output
-            full_response = ""
             for chunk in self.chat_session.process_command_stream(command):
-                full_response += chunk
-                self._append_chat_message(chunk, is_streaming=True)
+                chunk_str = str(chunk)
 
-            # Update status
-            self.plan_status.configure(text="Plan: Complete", text_color="green")
-            self.exec_status.configure(text="Execution: Complete", text_color="green")
+                def _append_chunk(text: str = chunk_str) -> None:
+                    self._append_chat_message(text, is_streaming=True)
+
+                self._run_on_ui_thread(_append_chunk)
+
+            def mark_complete() -> None:
+                self.plan_status.configure(text="Plan: Complete", text_color="green")
+                self.exec_status.configure(text="Execution: Complete", text_color="green")
+
+            self._run_on_ui_thread(mark_complete)
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
-            self._append_chat_message(error_msg)
+
+            def _append_error(msg: str = error_msg) -> None:
+                self._append_chat_message(msg)
+
+            self._run_on_ui_thread(_append_error)
             logger.exception("Error processing command")
-            self.plan_status.configure(text="Plan: Error", text_color="red")
-            self.exec_status.configure(text="Execution: Error", text_color="red")
+
+            def mark_error() -> None:
+                self.plan_status.configure(text="Plan: Error", text_color="red")
+                self.exec_status.configure(text="Execution: Error", text_color="red")
+
+            self._run_on_ui_thread(mark_error)
 
         finally:
             self._processing = False
-            self.send_button.configure(state="normal")
-            self.cancel_button.configure(state="disabled")
             self._current_command = ""
+
+            def reset_controls() -> None:
+                self.send_button.configure(state="normal")
+                self.cancel_button.configure(state="disabled")
+
+            self._run_on_ui_thread(reset_controls)
 
     def _append_chat_message(self, text: str, is_streaming: bool = False) -> None:
         """
@@ -283,7 +368,11 @@ class GUIApp(customtkinter.CTk):
         Args:
             status: Status text
         """
-        self.memory_status.configure(text=status, text_color="green")
+
+        def _update() -> None:
+            self.memory_status.configure(text=status, text_color="green")
+
+        self._run_on_ui_thread(_update)
 
     def update_tool_status(self, status: str) -> None:
         """
@@ -292,7 +381,11 @@ class GUIApp(customtkinter.CTk):
         Args:
             status: Status text
         """
-        self.tool_status.configure(text=status, text_color="green")
+
+        def _update() -> None:
+            self.tool_status.configure(text=status, text_color="green")
+
+        self._run_on_ui_thread(_update)
 
     def add_action(self, action_id: str, action_text: str) -> None:
         """
@@ -302,10 +395,14 @@ class GUIApp(customtkinter.CTk):
             action_id: Unique action identifier
             action_text: Description of the action
         """
-        self.actions_text.configure(state="normal")
-        self.actions_text.insert("end", f"[{action_id}] {action_text}\n")
-        self.actions_text.see("end")
-        self.actions_text.configure(state="disabled")
+
+        def _add() -> None:
+            self.actions_text.configure(state="normal")
+            self.actions_text.insert("end", f"[{action_id}] {action_text}\n")
+            self.actions_text.see("end")
+            self.actions_text.configure(state="disabled")
+
+        self._run_on_ui_thread(_add)
 
     def remove_action(self, action_id: str) -> None:
         """
@@ -314,13 +411,17 @@ class GUIApp(customtkinter.CTk):
         Args:
             action_id: Unique action identifier to remove
         """
-        self.actions_text.configure(state="normal")
-        content = self.actions_text.get("1.0", "end")
-        lines = content.split("\n")
-        new_lines = [line for line in lines if not line.startswith(f"[{action_id}]")]
-        self.actions_text.delete("1.0", "end")
-        self.actions_text.insert("1.0", "\n".join(new_lines))
-        self.actions_text.configure(state="disabled")
+
+        def _remove() -> None:
+            self.actions_text.configure(state="normal")
+            content = self.actions_text.get("1.0", "end")
+            lines = content.split("\n")
+            new_lines = [line for line in lines if not line.startswith(f"[{action_id}]")]
+            self.actions_text.delete("1.0", "end")
+            self.actions_text.insert("1.0", "\n".join(new_lines))
+            self.actions_text.configure(state="disabled")
+
+        self._run_on_ui_thread(_remove)
 
     def run(self) -> int:
         """
@@ -333,7 +434,7 @@ class GUIApp(customtkinter.CTk):
             logger.info("Starting GUI event loop")
             self.mainloop()
             return 0
-        except Exception as e:
+        except Exception:
             logger.exception("Error in GUI event loop")
             return 1
 
@@ -342,9 +443,10 @@ def create_gui_app(
     orchestrator: Orchestrator,
     reasoning_module: Optional[ReasoningModule] = None,
     config: Optional[JarvisConfig] = None,
-    voice_callback: Optional[Callable[[str], None]] = None,
+    voice_callback: Optional[Callable[[], None]] = None,
     dual_execution_orchestrator: Optional[Any] = None,
     memory_module: Optional[MemoryModule] = None,
+    sandbox_debug_mode: bool = False,
 ) -> GUIApp:
     """
     Create and return a GUI application instance.
@@ -356,6 +458,7 @@ def create_gui_app(
         voice_callback: Optional callback for voice input
         dual_execution_orchestrator: Optional dual execution orchestrator for code execution
         memory_module: Optional memory module for persistent conversation and execution tracking
+        sandbox_debug_mode: Enable sandbox viewer debug mode
 
     Returns:
         Configured GUIApp instance
@@ -367,4 +470,5 @@ def create_gui_app(
         voice_callback=voice_callback,
         dual_execution_orchestrator=dual_execution_orchestrator,
         memory_module=memory_module,
+        sandbox_debug_mode=sandbox_debug_mode,
     )

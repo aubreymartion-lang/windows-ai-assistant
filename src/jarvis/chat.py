@@ -13,6 +13,7 @@ from typing import Any, Dict, Generator, List, Optional
 
 from jarvis.config import JarvisConfig
 from jarvis.controller import Controller
+from jarvis.conversation_context import ConversationContext
 from jarvis.intent_classifier import IntentClassifier
 from jarvis.memory_models import ExecutionMemory
 from jarvis.memory_reference_resolver import ReferenceResolver
@@ -104,7 +105,15 @@ class ChatSession:
 
         # Initialize intent classifier and response generator if not provided
         self.intent_classifier = intent_classifier or IntentClassifier()
-        self.response_generator = response_generator or ResponseGenerator()
+
+        # Initialize conversation memory for context-aware responses
+        if response_generator and hasattr(response_generator, "conversation_memory"):
+            self.response_generator = response_generator
+        else:
+            self.conversation_memory = ConversationContext()
+            self.response_generator = response_generator or ResponseGenerator(
+                conversation_memory=self.conversation_memory
+            )
 
         # Initialize memory search and reference resolver if memory module is available
         if memory_module:
@@ -184,7 +193,9 @@ class ChatSession:
         # Add recent conversation context
         if recent_conversations:
             context_parts.append("Recent Context:")
-            recent_context = self.memory_search.get_recent_context(num_turns=3)
+            recent_context = self.memory_search.get_recent_context(
+                recent_conversations, num_turns=3
+            )
             if recent_context:
                 context_parts.append(recent_context)
 
@@ -239,12 +250,17 @@ class ChatSession:
         for pattern in location_patterns:
             if re.search(pattern, user_input.lower()):
                 # Extract what they're looking for
-                subject = self.reference_resolver.extract_subject(user_input) if self.reference_resolver else None
+                subject = (
+                    self.reference_resolver.extract_subject(user_input)
+                    if self.reference_resolver
+                    else None
+                )
                 if subject:
                     file_locations = self.memory_module.get_file_locations(subject)
                     if file_locations:
-                        return f"Found {len(file_locations)} file(s) for '{subject}':\n" + "\n".join(
-                            f"  - {loc}" for loc in file_locations
+                        return (
+                            f"Found {len(file_locations)} file(s) for '{subject}':\n"
+                            + "\n".join(f"  - {loc}" for loc in file_locations)
                         )
 
         return None
@@ -253,7 +269,7 @@ class ChatSession:
         self,
         user_message: str,
         assistant_response: str,
-        execution_history: List[ExecutionMemory] = None,
+        execution_history: Optional[List[ExecutionMemory]] = None,
     ) -> None:
         """
         Save conversation turn to memory.
