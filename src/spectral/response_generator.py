@@ -396,6 +396,9 @@ class ResponseGenerator:
         """
         Generate a summary response for commands.
 
+        For simple task results (direct output), uses LLM to present naturally.
+        For complex task results (plans, executions), uses summary templates.
+
         Args:
             original_input: Original user command
             execution_result: Result from execution
@@ -406,6 +409,29 @@ class ResponseGenerator:
         """
         logger.debug(f"Generating command response for: {original_input}")
 
+        # Check if this is a simple task result (direct output, not plan/execution metadata)
+        # Simple results look like: "Your IP address is: 192.168.1.1" or "Files in Desktop:"
+        is_simple_result = self._is_simple_task_result(execution_result)
+
+        if is_simple_result and self.llm_client:
+            # Use LLM to present simple task results naturally
+            prompt = f"""The user asked: "{original_input}"
+
+You executed this and got:
+{execution_result}
+
+Present the result naturally and conversationally. Be brief and helpful.
+Format clearly if it's a list or data. Don't say "let me fetch that" or make promises.
+Just present the result directly in a friendly way."""
+
+            try:
+                response = self.llm_client.generate(prompt)
+                return str(response).strip()
+            except Exception as e:
+                logger.warning(f"Failed to generate response: {e}")
+                return execution_result
+
+        # For complex task results, use the existing summary logic
         # Parse execution result for status
         total_steps, successful_steps = self._parse_execution_status(execution_result)
 
@@ -423,6 +449,45 @@ class ResponseGenerator:
         # Unknown status (fallback)
         else:
             return self._build_neutral_summary(original_input, execution_result)
+
+    def _is_simple_task_result(self, execution_result: str) -> bool:
+        """
+        Check if execution result is from a simple task (direct output).
+
+        Args:
+            execution_result: Execution result string
+
+        Returns:
+            True if this is a simple task result
+        """
+        # Simple task results don't contain plan/execution metadata
+        # They look like direct output: "Your IP address is:", "Files in Desktop:", etc.
+
+        # Exclude if it contains plan/execution markers
+        excluded_patterns = [
+            "Plan ID:",
+            "Plan Execution",
+            "Step Result:",
+            "Execution Summary:",
+            "✓ Execution Result:",
+            "📋 Plan:",
+            "📌 Steps:",
+        ]
+
+        result_lower = execution_result.lower()
+        for pattern in excluded_patterns:
+            if pattern.lower() in result_lower:
+                return False
+
+        # Check if it looks like simple task output
+        simple_indicators = [
+            "your ip address",
+            "files in",
+            "contents of",
+            "command executed",
+        ]
+
+        return any(indicator in result_lower for indicator in simple_indicators)
 
     def _build_success_summary(self, original_input: str, execution_result: str) -> str:
         """Build a success summary response."""
@@ -493,6 +558,9 @@ class ResponseGenerator:
         """
         Build prompt for casual conversation response.
 
+        Context is included for AI understanding but should not necessarily be verbalized.
+        Only reference context when directly relevant to the current question.
+
         Args:
             user_input: User's conversational input
             memory_context: Optional memory context from previous conversations
@@ -519,20 +587,22 @@ class ResponseGenerator:
                 history_section = "Recent conversation:\n" + "\n".join(history_lines) + "\n\n"
 
         # Build context section if memory_context is available
+        # This is for AI understanding, not verbalization
         context_section = ""
         if memory_context:
-            context_section = f"Context from memory:\n{memory_context}\n\n"
+            context_section = f"[BACKGROUND: {memory_context}]\n\n"
 
         prompt = f"""{capabilities}
 
 {history_section}{context_section}User: "{user_input}"
 
-Respond naturally and conversationally. Be warm, friendly, and brief.
-If the conversation is continuing (not a fresh greeting), acknowledge what was discussed before.
-Don't use repetitive greetings like "Hello again!" when continuing a conversation.
+Respond naturally and conversationally. Be friendly and brief.
+Only reference past conversations or context when directly relevant to the current question.
+Never mention that you "remember" unless it's genuinely important to the answer.
+Don't use repetitive preambles like "As I recall" or "Hello again!".
 Answer their question directly or acknowledge their message appropriately.
 When asked what you can do, mention your actual capabilities (code, files, commands, etc.).
 
 Keep your response under 3 sentences unless they're asking a complex question.
-Be conversational but professional."""
+Be conversational and professional."""
         return prompt

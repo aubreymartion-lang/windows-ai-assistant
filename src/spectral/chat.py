@@ -27,6 +27,7 @@ from spectral.reasoning import Plan, ReasoningModule
 from spectral.research_intent_handler import ResearchIntentHandler
 from spectral.response_generator import ResponseGenerator
 from spectral.retry_parsing import parse_retry_limit
+from spectral.simple_task_executor import SimpleTaskExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -606,9 +607,11 @@ class ChatSession:
         """
         Process a user command and stream formatted response chunks.
 
-        Uses the dual execution orchestrator for code execution requests,
-        the controller (dual-model stack) if available, otherwise
-        falls back to orchestrator + reasoning module.
+        Uses hybrid execution:
+        - Simple tasks handled immediately via SimpleTaskExecutor
+        - Research intents routed to research handler
+        - Casual conversation handled directly
+        - Complex tasks delegated to dual execution orchestrator or controller
 
         Args:
             user_input: User's natural language input
@@ -619,7 +622,49 @@ class ChatSession:
         """
         logger.info(f"Processing user input with streaming: {user_input}")
 
-        # Check for research intent first
+        # Try simple task executor first for immediate results
+        simple_executor = SimpleTaskExecutor()
+        if simple_executor.can_handle(user_input):
+            logger.info(f"Handling as simple task: {user_input}")
+            result = simple_executor.execute(user_input)
+
+            if result:
+                # Use LLM to generate natural response if available
+                memory_context = self._build_context_from_memory(user_input)
+
+                full_response = ""
+                if self.response_generator.llm_client:
+                    for chunk in self.response_generator.generate_response_stream(
+                        intent="command",
+                        execution_result=result,
+                        original_input=user_input,
+                        memory_context=memory_context,
+                    ):
+                        full_response += chunk
+                        yield chunk
+                else:
+                    # Fallback to simple response
+                    full_response = result
+                    yield result
+
+                # Add to history
+                context = self.get_context_summary()
+                self.add_message(
+                    "user", user_input, metadata={"context": context, "intent": "command"}
+                )
+                self.add_message(
+                    "assistant", full_response, metadata={"intent": "command", "simple_task": True}
+                )
+
+                # Save to memory
+                self._save_to_memory(
+                    user_message=user_input,
+                    assistant_response=full_response,
+                    execution_history=[],
+                )
+                return
+
+        # Check for research intent
         mode, confidence = self.execution_router.classify(user_input)
         logger.debug(f"Execution mode classified as: {mode} with confidence {confidence:.2f}")
 
