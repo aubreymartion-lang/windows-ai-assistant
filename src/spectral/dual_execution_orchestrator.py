@@ -105,6 +105,13 @@ class DualExecutionOrchestrator:
 
         logger.info("Executing in DIRECT mode")
 
+        # Check if research is needed for this request
+        needs_research, tool_name = self.router.should_research(user_input)
+        if needs_research:
+            logger.info(f"Research needed for '{tool_name}', routing to RESEARCH_AND_ACT mode")
+            yield from self._execute_research_and_act_mode(user_input, max_attempts=max_attempts)
+            return
+
         try:
             for output in self.direct_executor.execute_request(
                 user_input, max_attempts=max_attempts
@@ -139,15 +146,36 @@ class DualExecutionOrchestrator:
 
             yield "🚀 Step 2: Executing based on research findings...\n"
 
-            # Inject research into prompt
-            augmented_input = f"""
-User Request: {user_input}
+            # Extract research context for code generation
+            research_context = ""
+            if pack:
+                if pack.commands:
+                    research_context += "\nCommands from research:\n"
+                    for cmd in pack.commands[:5]:
+                        cmd_text = cmd.get("command_text", "")
+                        desc = cmd.get("description", "")
+                        if cmd_text:
+                            research_context += f"- {cmd_text}"
+                            if desc:
+                                research_context += f" ({desc})"
+                            research_context += "\n"
 
-Research Findings:
-{research_response}
+                if pack.steps:
+                    research_context += "\nSteps from research:\n"
+                    for step in pack.steps[:5]:
+                        title = step.get("title", "")
+                        if title:
+                            research_context += f"- {title}\n"
 
-Please complete the user request using the research findings provided above.
-"""
+            # Inject research into prompt with code generation instructions
+            augmented_input = f"""User Request: {user_input}
+
+Research Context:
+{research_context}
+
+Based on the research above, generate and execute Python code that accomplishes the user's goal.
+Use the actual commands/syntax from the research. Include necessary imports and error handling.
+Save any generated files to the Desktop."""
             # Route based on complexity
             mode, confidence = self.router.classify(user_input)
             if mode == ExecutionMode.PLANNING or len(user_input.split()) > 10:

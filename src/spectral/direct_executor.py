@@ -14,7 +14,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Generator, Optional
+from typing import Callable, Generator, List, Optional
 
 from spectral.gui_test_generator import GUITestGenerator
 from spectral.intelligent_retry import IntelligentRetryManager
@@ -546,6 +546,7 @@ class DirectExecutor:
 
                     # Export to desktop
                     yield "💾 Exporting verified code to Desktop...\n"
+                    desktop_path = None
                     try:
                         desktop_path = self.save_code_to_desktop(
                             code, user_request, result.code_path, filename=target_filename
@@ -554,10 +555,15 @@ class DirectExecutor:
                     except Exception as e:
                         yield f"   ⚠️  Could not save to Desktop: {e}\n"
 
+                    # Extract actual file locations (Desktop paths)
+                    file_locations = self._extract_file_locations(
+                        user_request, desktop_path, target_filename
+                    )
+
                     # Save run metadata
                     self.sandbox_manager.save_run_metadata(run_id, result)
 
-                    # Save comprehensive execution metadata
+                    # Save comprehensive execution metadata with file_locations
                     execution_metadata = {
                         "run_id": run_id,
                         "timestamp": datetime.now().isoformat(),
@@ -571,6 +577,7 @@ class DirectExecutor:
                         "execution_error": result.log_stderr,
                         "attempts": attempt,
                         "last_error": None,
+                        "file_locations": file_locations,  # Include actual file paths
                     }
                     self.sandbox_manager.save_execution_metadata(execution_metadata)
 
@@ -795,6 +802,56 @@ class DirectExecutor:
                 flags=re.IGNORECASE,
             )
         return code
+
+    def _extract_file_locations(
+        self,
+        user_request: str,
+        desktop_path: Optional[Path],
+        filename: str,
+    ) -> List[str]:
+        """
+        Extract actual file locations from Desktop and other locations.
+
+        Args:
+            user_request: Original user request for filename extraction
+            desktop_path: Path to file on Desktop if saved
+            filename: Target filename
+
+        Returns:
+            List of file paths where files were created
+        """
+        file_locations: List[str] = []
+
+        # Add Desktop path if it exists
+        if desktop_path and Path(desktop_path).exists():
+            file_locations.append(str(desktop_path))
+
+        # Also check Desktop for files matching the prompt pattern
+        desktop = Path.home() / "Desktop"
+
+        # Generate expected filename from user request
+        expected_base = self._generate_safe_filename(user_request)
+
+        if desktop.exists():
+            # Look for matching files on Desktop
+            for file_path in desktop.iterdir():
+                if file_path.is_file():
+                    # Check if it matches the expected pattern
+                    file_name_lower = file_path.name.lower()
+                    expected_lower = expected_base.lower()
+
+                    # Check for spectral_* pattern or exact match
+                    if (
+                        file_name_lower.startswith("spectral_")
+                        or file_name_lower.startswith(expected_lower)
+                        or file_name_lower.replace("_", "").startswith(expected_lower.replace("_", ""))
+                    ):
+                        # Verify it's a Python file or matches the target filename
+                        if file_path.suffix == ".py" or filename in file_path.name:
+                            if str(file_path) not in file_locations:
+                                file_locations.append(str(file_path))
+
+        return file_locations
 
     def _generate_fix_code(
         self,

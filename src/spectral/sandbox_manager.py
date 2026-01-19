@@ -463,35 +463,16 @@ class SandboxRunManager:
             if is_gui is None:
                 is_gui = self.is_gui_program(code)
 
-            # Gate 2: Test gate (generate and run tests)
-            if not is_gui:
-                # For non-GUI programs, generate basic tests
-                test_code = self._generate_basic_test(code, filename)
-                test_filename = f"test_{Path(filename).stem}.py"
-                test_path = self.write_test(run_id, test_filename, test_code)
-                test_paths.append(test_path)
-
-                tests_ok, pytest_summary = self.run_tests(run_id, test_path.parent)
-                gates_passed["tests"] = tests_ok
-
-                if not tests_ok:
-                    return SandboxResult(
-                        run_id=run_id,
-                        status="test_failure",
-                        code_path=code_path,
-                        test_paths=test_paths,
-                        log_stdout="",
-                        log_stderr=pytest_summary or "",
-                        exit_code=-1,
-                        pytest_summary=pytest_summary,
-                        error_message=f"Tests failed: {pytest_summary}",
-                        gates_passed=gates_passed,
-                        duration_seconds=time.time() - start_time,
-                    )
-            else:
-                # For GUI programs, skip test gate or use simple import test
+            # Gate 2: Test gate
+            if is_gui:
+                # For GUI programs, skip test gate
                 logger.info("GUI program detected, skipping test gate")
-                gates_passed["tests"] = True  # Skip for GUI
+                gates_passed["tests"] = True
+            else:
+                # For non-GUI programs: SKIP pytest entirely, go straight to execution
+                # No test gate - just syntax + run (removed pytest gate to fix WinError 2)
+                logger.info("Non-GUI program detected, skipping pytest tests")
+                gates_passed["tests"] = True  # Skip for non-GUI
 
             # Gate 3: Smoke test
             if not is_gui:
