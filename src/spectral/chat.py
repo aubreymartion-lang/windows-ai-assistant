@@ -1259,26 +1259,12 @@ class ChatSession:
         try:
             # First, check if this is a code execution request for dual execution orchestrator
             if self.dual_execution_orchestrator:
-                # Check if user input matches code execution patterns
-                code_keywords = [
-                    "write",
-                    "code",
-                    "program",
-                    "script",
-                    "run",
-                    "execute",
-                    "create",
-                    "generate",
-                    "build",
-                    "make",
-                    "implement",
-                    "develop",
-                ]
-                input_lower = user_input.lower()
-                has_code_keyword = any(keyword in input_lower for keyword in code_keywords)
+                # Use semantic intent classifier instead of rigid keywords
+                intent, confidence = self.semantic_classifier.classify(user_input)
 
-                if has_code_keyword:
-                    logger.debug("Using dual execution orchestrator for code execution")
+                # Check for code intent with reasonable confidence
+                if intent == SemanticIntent.CODE and confidence >= 0.5:
+                    logger.debug(f"Using dual execution orchestrator for code execution (intent: {intent}, confidence: {confidence:.2f})")
                     try:
                         for chunk in self.dual_execution_orchestrator.process_request(
                             user_input, max_attempts=max_attempts
@@ -1292,7 +1278,7 @@ class ChatSession:
                         self.add_message(
                             "assistant",
                             full_response,
-                            metadata={"execution_mode": "dual_execution"},
+                            metadata={"execution_mode": "dual_execution", "intent": intent.value},
                         )
                         return
                     except Exception as e:
