@@ -74,15 +74,115 @@ class Orchestrator:
         """
         logger.info(f"Handling command: {command}")
 
+        # Try to execute the command using system_action_router if available
+        if self.system_action_router:
+            try:
+                logger.debug("Attempting to execute command via system_action_router")
+                # Try to parse and execute as a system action
+                action_type, params = self._parse_simple_action(command)
+                
+                if action_type:
+                    logger.info(f"Executing action: {action_type} with params: {params}")
+                    action_result = self.system_action_router.execute_action(action_type, **params)
+                    
+                    if action_result and action_result.success:
+                        return {
+                            "status": "success",
+                            "command": command,
+                            "message": action_result.message or f"Command '{command}' executed successfully",
+                            "data": action_result.output,
+                        }
+                    elif action_result:
+                        return {
+                            "status": "error",
+                            "command": command,
+                            "message": action_result.message or f"Command '{command}' failed",
+                            "data": action_result.output,
+                        }
+            except Exception as e:
+                logger.warning(f"Failed to execute command via system_action_router: {e}")
+
+        # Fallback: return acknowledgment (but log that execution was not performed)
+        logger.warning(f"Command not executed, returning acknowledgment only: {command}")
         result = {
-            "status": "success",
+            "status": "acknowledged",  # Changed from "success" to indicate no execution
             "command": command,
-            "message": f"Command '{command}' processed successfully",
+            "message": f"Command '{command}' acknowledged but not executed. Consider using code generation for this task.",
             "data": None,
         }
 
         logger.debug(f"Command result: {result}")
         return result
+    
+    def _parse_simple_action(self, command: str) -> tuple[Optional[str], Dict[str, Any]]:
+        """
+        Parse a simple command into action type and parameters.
+        
+        Args:
+            command: Natural language command
+            
+        Returns:
+            Tuple of (action_type, params) or (None, {}) if not parseable
+        """
+        import re
+        
+        command_lower = command.lower()
+        
+        # File operations
+        if any(word in command_lower for word in ['list', 'show', 'display']) and \
+           any(word in command_lower for word in ['file', 'folder', 'directory', 'desktop', 'documents']):
+            # List files
+            path_match = re.search(r'(?:in|from|at)\s+([^\s,]+)', command, re.IGNORECASE)
+            if path_match:
+                return "list_directory", {"path": path_match.group(1)}
+            elif 'desktop' in command_lower:
+                return "list_directory", {"path": "~/Desktop"}
+            elif 'documents' in command_lower:
+                return "list_directory", {"path": "~/Documents"}
+            return "list_directory", {"path": "."}
+            
+        # File creation
+        if any(word in command_lower for word in ['create', 'make', 'write']) and 'file' in command_lower:
+            # Create file
+            name_match = re.search(r'(?:named|called|file)\s+([^\s,]+)', command, re.IGNORECASE)
+            path_match = re.search(r'(?:on|in|at)\s+(?:my\s+)?(\w+)', command, re.IGNORECASE)
+            
+            params = {}
+            if name_match:
+                params["filename"] = name_match.group(1)
+            if path_match:
+                location = path_match.group(1).lower()
+                if location == 'desktop':
+                    params["path"] = "~/Desktop"
+                elif location == 'documents':
+                    params["path"] = "~/Documents"
+            
+            if params:
+                return "create_file", params
+                
+        # Network scanning
+        if any(word in command_lower for word in ['scan', 'check', 'test']) and \
+           any(word in command_lower for word in ['network', 'port', 'host', 'ip']):
+            # Network scan
+            ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', command)
+            if ip_match:
+                return "network_scan", {"target": ip_match.group()}
+            return "network_scan", {"target": "localhost"}
+            
+        # Web search
+        if any(word in command_lower for word in ['search', 'find', 'look']) and \
+           any(word in command_lower for word in ['web', 'internet', 'google', 'online']):
+            # Web search
+            query_match = re.search(r'(?:for|about)\s+(.+)', command, re.IGNORECASE)
+            if query_match:
+                return "web_search", {"query": query_match.group(1).strip()}
+                
+        # System info
+        if any(word in command_lower for word in ['get', 'show', 'display']) and \
+           any(word in command_lower for word in ['system', 'info', 'information', 'details']):
+            return "system_info", {}
+            
+        return None, {}
 
     def execute_plan(self, plan: Plan) -> Dict[str, Any]:
         """
