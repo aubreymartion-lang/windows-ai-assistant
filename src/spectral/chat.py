@@ -31,13 +31,14 @@ from spectral.memory_models import ExecutionMemory
 from spectral.memory_reference_resolver import ReferenceResolver
 from spectral.memory_search import MemorySearch
 from spectral.orchestrator import Orchestrator
-from spectral.penetration_tester import PenetrationTester
+from spectral.pentesting_assistant import PentestingAssistant
 from spectral.persistent_memory import MemoryModule
 from spectral.prompts import METASPLOIT_SYSTEM_PROMPT
 from spectral.reasoning import Plan, ReasoningModule
 from spectral.research_intent_handler import ResearchIntentHandler
 from spectral.response_generator import ResponseGenerator
 from spectral.retry_parsing import parse_retry_limit
+from spectral.semantic_intent_classifier import SemanticIntent, SemanticIntentClassifier
 from spectral.simple_task_executor import SimpleTaskExecutor
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,21 @@ class ChatSession:
         # Initialize research handler and execution router
         self.research_handler = ResearchIntentHandler(config=config)
         self.execution_router = ExecutionRouter()
+
+        # Initialize semantic intent classifier and pentesting assistant
+        llm_client_for_classifiers = (
+            self.response_generator.llm_client
+            if hasattr(self.response_generator, "llm_client")
+            else None
+        )
+
+        self.semantic_classifier = SemanticIntentClassifier(llm_client=llm_client_for_classifiers)
+
+        self.pentesting_assistant = PentestingAssistant(
+            llm_client=llm_client_for_classifiers,
+            research_handler=self.research_handler,
+            semantic_classifier=self.semantic_classifier,
+        )
 
     def add_message(
         self,
@@ -450,7 +466,9 @@ class ChatSession:
 
     def _is_penetration_test_request(self, user_input: str) -> bool:
         """
-        Detect if user request is related to penetration testing (more flexible).
+        Detect if user request is related to penetration testing using semantic classification.
+
+        Uses semantic intent classifier for typo-tolerant, phrasing-agnostic detection.
 
         Args:
             user_input: User's natural language input
@@ -458,18 +476,15 @@ class ChatSession:
         Returns:
             True if this is a penetration testing request
         """
-        import re
+        # Use semantic classifier for intelligent detection
+        intent, confidence = self.semantic_classifier.classify(user_input)
 
-        # Flexible patterns for pentest requests - more conversational than hardcoded keywords
-        pentest_patterns = [
-            r"\b(test|exploit|penetration|pentest|hack|crack|assess|auditvulnerability)\b",
-            r"\btarget\b.*\b(windows|linux|android|ios|server|machine|computer)\b",
-            r"\b(?:\d{1,3}\.){3}\d{1,3}\b.*\b(windows|linux|ssh|rdp|smb|http|service)\b",  # IP + OS/service
-            r"\b(cve|vulnerability|vuln|exploit)\b.*\b(windows|linux|android|ios)\b",
-            r"\b(reverse shell|backdoor|rce|remote code|privilege escalation|privesc)\b",
-        ]
+        # Check for exploitation or reconnaissance intents
+        if intent in [SemanticIntent.EXPLOITATION, SemanticIntent.RECONNAISSANCE]:
+            logger.info(f"Detected {intent.value} intent (confidence: {confidence:.2f})")
+            return True
 
-        return any(re.search(pattern, user_input, re.IGNORECASE) for pattern in pentest_patterns)
+        return False
 
     def _handle_metasploit_request(self, user_input: str) -> str:
         """
@@ -669,24 +684,15 @@ class ChatSession:
 
     def _handle_intelligent_penetration_test(self, user_input: str) -> str:
         """
-        Handle penetration testing request through intelligent conversation.
+        Handle penetration testing request with intelligent conversation.
 
-        NOT hardcoded shortcuts - uses AI reasoning and research.
+        Uses PentestingAssistant with methodology enforcement.
+        NO hardcoded shortcuts - always asks clarifying questions first.
         """
         logger.info("Penetration test request detected - using intelligent methodology")
 
-        # Initialize penetration tester if needed
-        if not hasattr(self, "_pentest_assistant"):
-            research_handler = None
-            if hasattr(self, "research_handler"):
-                research_handler = self.research_handler
-
-            self._pentest_assistant = PenetrationTester(
-                llm_client=self.response_generator.llm_client, research_handler=research_handler
-            )
-
-        # Get intelligent response (NOT shortcut execution)
-        response = self._pentest_assistant.handle_pentest_request(user_input)
+        # Use PentestingAssistant (methodology enforced, no shortcuts)
+        response = self.pentesting_assistant.handle_pentest_request(user_input)
 
         # Add to history
         context = self.get_context_summary()
@@ -722,18 +728,8 @@ class ChatSession:
         """
         logger.info("Penetration test request detected in stream - using intelligent methodology")
 
-        # Initialize penetration tester if needed
-        if not hasattr(self, "_pentest_assistant"):
-            research_handler = None
-            if hasattr(self, "research_handler"):
-                research_handler = self.research_handler
-
-            self._pentest_assistant = PenetrationTester(
-                llm_client=self.response_generator.llm_client, research_handler=research_handler
-            )
-
-        # Get intelligent response (NOT shortcut execution)
-        response = self._pentest_assistant.handle_pentest_request(user_input)
+        # Use PentestingAssistant (methodology enforced, no shortcuts)
+        response = self.pentesting_assistant.handle_pentest_request(user_input)
 
         # Add to history
         context = self.get_context_summary()
