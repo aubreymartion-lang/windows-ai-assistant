@@ -5,16 +5,20 @@ Handles DIRECT mode requests: generate code, verify in sandbox, execute in isola
 Integrates with SandboxRunManager for robust verification pipeline.
 """
 
+import ast
 import logging
+import os
 import re
+import select
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Generator, List, Optional
+from typing import Callable, Dict, Generator, List, Optional, Set
 
 from spectral.gui_test_generator import GUITestGenerator
 from spectral.intelligent_retry import IntelligentRetryManager
@@ -23,7 +27,6 @@ from spectral.memory_models import ExecutionMemory
 from spectral.mistake_learner import MistakeLearner
 from spectral.persistent_memory import MemoryModule
 from spectral.retry_parsing import format_attempt_progress, parse_retry_limit
-from spectral.sandbox_manager import SandboxResult, SandboxRunManager
 from spectral.utils import (
     AUTONOMOUS_CODE_REQUIREMENT,
     SmartInputHandler,
@@ -34,6 +37,979 @@ from spectral.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ValidationIssue:
+    """Represents a code validation issue."""
+
+    severity: str  # "warning" or "error"
+    issue_type: str  # "infinite_loop", "missing_timeout", "blocking_call", etc.
+    message: str
+    line_number: Optional[int] = None
+    suggestion: Optional[str] = None
+
+
+@dataclass
+class ValidationResult:
+    """Result of code validation."""
+
+    is_valid: bool
+    issues: List[ValidationIssue]
+    checks_performed: List[str]
+
+    def has_errors(self) -> bool:
+        """Check if validation found any errors (not just warnings)."""
+        return any(issue.severity == "error" for issue in self.issues)
+
+    def get_error_messages(self) -> List[str]:
+        """Get all error messages."""
+        return [issue.message for issue in self.issues if issue.severity == "error"]
+
+    def get_warning_messages(self) -> List[str]:
+        """Get all warning messages."""
+        return [issue.message for issue in self.issues if issue.severity == "warning"]
+
+
+class CodeValidator:
+    """
+    Validates generated code for common issues before execution.
+
+    Performs static analysis to detect:
+    - Infinite loops (while True without break/timeout)
+    - Missing timeouts on I/O operations
+    - Blocking calls (input(), long sleep())
+    - Missing structure (functions without returns)
+    - Logic errors (unreachable code, undefined variables)
+    """
+
+    def __init__(self):
+        self.checks_performed: List[str] = []
+
+    def validate(self, code: str) -> ValidationResult:
+        """
+        Validate code for common issues.
+
+        Args:
+            code: Python code to validate
+
+        Returns:
+            ValidationResult with detected issues
+        """
+        self.checks_performed = []
+        issues: List[ValidationIssue] = []
+
+        # Try to parse the code as AST
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    issue_type="syntax_error",
+                    message=f"Syntax error: {e.msg}",
+                    line_number=e.lineno,
+                    suggestion="Fix syntax errors before execution",
+                )
+            )
+            return ValidationResult(is_valid=False, issues=issues, checks_performed=["syntax"])
+
+        # Perform all validation checks
+        issues.extend(self._check_infinite_loops(tree, code))
+        issues.extend(self._check_missing_timeouts(tree, code))
+        issues.extend(self._check_blocking_calls(tree, code))
+        issues.extend(self._check_missing_returns(tree))
+        issues.extend(self._check_unreachable_code(tree))
+        issues.extend(self._check_undefined_variables(tree))
+
+        # Determine if code is valid (no errors, warnings are OK)
+        has_errors = any(issue.severity == "error" for issue in issues)
+        is_valid = not has_errors
+
+        return ValidationResult(
+            is_valid=is_valid, issues=issues, checks_performed=self.checks_performed
+        )
+
+    def _check_infinite_loops(self, tree: ast.AST, code: str) -> List[ValidationIssue]:
+        """Check for infinite loops without break/timeout conditions."""
+        self.checks_performed.append("infinite_loops")
+        issues: List[ValidationIssue] = []
+
+        class LoopVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.issues: List[ValidationIssue] = []
+
+            def visit_While(self, node: ast.While):
+                # Check for while True without break
+                if isinstance(node.test, ast.Constant) and node.test.value is True:
+                    has_break = self._has_break_or_return(node.body)
+                    has_timeout_logic = self._has_timeout_logic(node.body)
+
+                    if not has_break and not has_timeout_logic:
+                        self.issues.append(
+                            ValidationIssue(
+                                severity="error",
+                                issue_type="infinite_loop",
+                                message="Infinite loop detected: 'while True' without break or timeout",
+                                line_number=node.lineno,
+                                suggestion="Add a break condition, timeout check, or iteration counter",
+                            )
+                        )
+                self.generic_visit(node)
+
+            def visit_For(self, node: ast.For):
+                # Check for potentially infinite ranges
+                if isinstance(node.iter, ast.Call):
+                    if isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range":
+                        # Check for very large ranges that might be mistakes
+                        if len(node.iter.args) > 0:
+                            arg = node.iter.args[0]
+                            if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                                if arg.value > 1000000:  # More than 1M iterations
+                                    self.issues.append(
+                                        ValidationIssue(
+                                            severity="warning",
+                                            issue_type="large_loop",
+                                            message=f"Very large loop detected: range({arg.value})",
+                                            line_number=node.lineno,
+                                            suggestion="Consider adding progress indicators or breaking into smaller chunks",
+                                        )
+                                    )
+                self.generic_visit(node)
+
+            def _has_break_or_return(self, body: List[ast.stmt]) -> bool:
+                """Check if body contains break or return statement."""
+                for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+                    if isinstance(node, (ast.Break, ast.Return)):
+                        return True
+                return False
+
+            def _has_timeout_logic(self, body: List[ast.stmt]) -> bool:
+                """Check if body contains timeout-related logic."""
+                for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+                    # Look for time.time() comparisons or timeout variables
+                    if isinstance(node, ast.Compare):
+                        for comp in ast.walk(node):
+                            if isinstance(comp, ast.Attribute):
+                                if comp.attr in ["time", "timeout", "elapsed"]:
+                                    return True
+                            if isinstance(comp, ast.Name):
+                                if comp.id in ["timeout", "start_time", "elapsed", "deadline"]:
+                                    return True
+                return False
+
+        visitor = LoopVisitor()
+        visitor.visit(tree)
+        issues.extend(visitor.issues)
+
+        # Also check for recursive functions without clear base case
+        issues.extend(self._check_recursive_functions(tree))
+
+        return issues
+
+    def _check_recursive_functions(self, tree: ast.AST) -> List[ValidationIssue]:
+        """Check for recursive functions without obvious base case."""
+        issues: List[ValidationIssue] = []
+
+        class RecursionVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.issues: List[ValidationIssue] = []
+                self.current_function: Optional[str] = None
+
+            def visit_FunctionDef(self, node: ast.FunctionDef):
+                old_function = self.current_function
+                self.current_function = node.name
+
+                # Check if function calls itself
+                has_recursive_call = False
+                has_base_case = False
+
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Call):
+                        if isinstance(child.func, ast.Name) and child.func.id == node.name:
+                            has_recursive_call = True
+
+                    # Look for return statements (potential base cases)
+                    if isinstance(child, ast.Return):
+                        has_base_case = True
+
+                if has_recursive_call and not has_base_case:
+                    self.issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            issue_type="recursive_no_base",
+                            message=f"Recursive function '{node.name}' may lack base case",
+                            line_number=node.lineno,
+                            suggestion="Ensure function has clear termination condition",
+                        )
+                    )
+
+                self.generic_visit(node)
+                self.current_function = old_function
+
+        visitor = RecursionVisitor()
+        visitor.visit(tree)
+        return visitor.issues
+
+    def _check_missing_timeouts(self, tree: ast.AST, code: str) -> List[ValidationIssue]:
+        """Check for I/O operations without timeouts."""
+        self.checks_performed.append("missing_timeouts")
+        issues: List[ValidationIssue] = []
+
+        class TimeoutVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.issues: List[ValidationIssue] = []
+                self.has_socket_timeout = False
+
+            def visit_Call(self, node: ast.Call):
+                # Check for socket operations
+                if isinstance(node.func, ast.Attribute):
+                    # socket.socket() creation
+                    if node.func.attr == "socket":
+                        # Look ahead for .settimeout() call
+                        self.issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                issue_type="missing_timeout",
+                                message="Socket created without explicit timeout",
+                                line_number=node.lineno,
+                                suggestion="Add socket.settimeout(timeout_seconds) after creation",
+                            )
+                        )
+
+                    # socket.connect() without timeout
+                    if node.func.attr in ["connect", "accept", "recv", "recvfrom"]:
+                        self.issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                issue_type="missing_timeout",
+                                message=f"Socket operation '{node.func.attr}' may block indefinitely",
+                                line_number=node.lineno,
+                                suggestion="Ensure socket has timeout set with settimeout()",
+                            )
+                        )
+
+                    # threading operations without timeout
+                    if node.func.attr == "join" and not node.args:
+                        self.issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                issue_type="missing_timeout",
+                                message="Thread.join() called without timeout",
+                                line_number=node.lineno,
+                                suggestion="Add timeout parameter: thread.join(timeout=30)",
+                            )
+                        )
+
+                    # requests library without timeout
+                    if node.func.attr in ["get", "post", "put", "delete", "request"]:
+                        has_timeout = any(
+                            isinstance(kw.value, (ast.Constant, ast.Name)) and kw.arg == "timeout"
+                            for kw in node.keywords
+                        )
+                        if not has_timeout:
+                            self.issues.append(
+                                ValidationIssue(
+                                    severity="warning",
+                                    issue_type="missing_timeout",
+                                    message=f"HTTP request '{node.func.attr}' without timeout",
+                                    line_number=node.lineno,
+                                    suggestion="Add timeout parameter: requests.get(url, timeout=10)",
+                                )
+                            )
+
+                self.generic_visit(node)
+
+        visitor = TimeoutVisitor()
+        visitor.visit(tree)
+        issues.extend(visitor.issues)
+
+        # Regex check for common blocking patterns
+        # Check if code has socket creation but no settimeout() call
+        has_socket = re.search(r"socket\.socket\s*\(", code)
+        has_timeout = re.search(r"settimeout\s*\(", code)
+
+        if has_socket and not has_timeout:
+            # This is a critical error - socket without timeout will block indefinitely
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    issue_type="missing_timeout",
+                    message="Socket code missing timeout configuration",
+                    suggestion="Add sock.settimeout(30) after socket creation",
+                )
+            )
+
+        return issues
+
+    def _check_blocking_calls(self, tree: ast.AST, code: str) -> List[ValidationIssue]:
+        """Check for blocking calls that may hang."""
+        self.checks_performed.append("blocking_calls")
+        issues: List[ValidationIssue] = []
+
+        class BlockingVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.issues: List[ValidationIssue] = []
+
+            def visit_Call(self, node: ast.Call):
+                # Check for input() calls
+                if isinstance(node.func, ast.Name) and node.func.id == "input":
+                    self.issues.append(
+                        ValidationIssue(
+                            severity="error",
+                            issue_type="blocking_call",
+                            message="input() call detected - will block execution",
+                            line_number=node.lineno,
+                            suggestion="Replace with hardcoded test value or remove interactive input",
+                        )
+                    )
+
+                # Check for sleep() with long duration
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "sleep":
+                    if node.args and isinstance(node.args[0], ast.Constant):
+                        sleep_time = node.args[0].value
+                        if isinstance(sleep_time, (int, float)) and sleep_time > 5:
+                            self.issues.append(
+                                ValidationIssue(
+                                    severity="warning",
+                                    issue_type="blocking_call",
+                                    message=f"Long sleep detected: {sleep_time} seconds",
+                                    line_number=node.lineno,
+                                    suggestion="Consider reducing sleep time or adding progress indicators",
+                                )
+                            )
+
+                self.generic_visit(node)
+
+        visitor = BlockingVisitor()
+        visitor.visit(tree)
+        return visitor.issues
+
+    def _check_missing_returns(self, tree: ast.AST) -> List[ValidationIssue]:
+        """Check for functions without return statements."""
+        self.checks_performed.append("missing_returns")
+        issues: List[ValidationIssue] = []
+
+        class ReturnVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.issues: List[ValidationIssue] = []
+
+            def visit_FunctionDef(self, node: ast.FunctionDef):
+                # Skip special methods and main function
+                if node.name.startswith("_") or node.name == "main":
+                    self.generic_visit(node)
+                    return
+
+                # Check if function has any return statement
+                has_return = False
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Return):
+                        has_return = True
+                        break
+
+                # Check if function has type hints suggesting it should return something
+                if node.returns is not None and not isinstance(node.returns, ast.Constant):
+                    if not has_return:
+                        self.issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                issue_type="missing_return",
+                                message=f"Function '{node.name}' has return type hint but no return statement",
+                                line_number=node.lineno,
+                                suggestion="Add explicit return statement",
+                            )
+                        )
+
+                self.generic_visit(node)
+
+        visitor = ReturnVisitor()
+        visitor.visit(tree)
+        return visitor.issues
+
+    def _check_unreachable_code(self, tree: ast.AST) -> List[ValidationIssue]:
+        """Check for unreachable code after return/break/continue."""
+        self.checks_performed.append("unreachable_code")
+        issues: List[ValidationIssue] = []
+
+        class UnreachableVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.issues: List[ValidationIssue] = []
+
+            def visit_FunctionDef(self, node: ast.FunctionDef):
+                self._check_block(node.body)
+                self.generic_visit(node)
+
+            def visit_If(self, node: ast.If):
+                self._check_block(node.body)
+                self._check_block(node.orelse)
+                self.generic_visit(node)
+
+            def visit_While(self, node: ast.While):
+                self._check_block(node.body)
+                self.generic_visit(node)
+
+            def visit_For(self, node: ast.For):
+                self._check_block(node.body)
+                self.generic_visit(node)
+
+            def _check_block(self, body: List[ast.stmt]):
+                """Check a block of statements for unreachable code."""
+                for i, stmt in enumerate(body):
+                    # If this is a return/break/continue and there's more code after
+                    if isinstance(stmt, (ast.Return, ast.Break, ast.Continue)):
+                        if i + 1 < len(body):
+                            next_stmt = body[i + 1]
+                            self.issues.append(
+                                ValidationIssue(
+                                    severity="warning",
+                                    issue_type="unreachable_code",
+                                    message="Unreachable code detected after return/break/continue",
+                                    line_number=next_stmt.lineno,
+                                    suggestion="Remove or restructure unreachable code",
+                                )
+                            )
+                            break
+
+        visitor = UnreachableVisitor()
+        visitor.visit(tree)
+        return visitor.issues
+
+    def _check_undefined_variables(self, tree: ast.AST) -> List[ValidationIssue]:
+        """Check for obvious undefined variable usage."""
+        self.checks_performed.append("undefined_variables")
+        issues: List[ValidationIssue] = []
+
+        class VariableVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.issues: List[ValidationIssue] = []
+                self.defined_vars: Set[str] = set()
+                self.used_before_def: Set[str] = set()
+                self.imported_modules: Set[str] = set()
+
+            def visit_Import(self, node: ast.Import):
+                # Track imported modules
+                for alias in node.names:
+                    name = alias.asname if alias.asname else alias.name
+                    self.imported_modules.add(name)
+                    self.defined_vars.add(name)
+                self.generic_visit(node)
+
+            def visit_ImportFrom(self, node: ast.ImportFrom):
+                # Track imported names
+                for alias in node.names:
+                    name = alias.asname if alias.asname else alias.name
+                    self.imported_modules.add(name)
+                    self.defined_vars.add(name)
+                self.generic_visit(node)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef):
+                # Add function name to defined variables
+                self.defined_vars.add(node.name)
+
+                # Save current scope
+                old_vars = self.defined_vars.copy()
+
+                # Add function parameters to defined variables
+                for arg in node.args.args:
+                    self.defined_vars.add(arg.arg)
+
+                # Visit function body
+                self.generic_visit(node)
+
+                # Restore scope
+                self.defined_vars = old_vars
+
+            def visit_For(self, node: ast.For):
+                # Add loop variable to defined variables
+                if isinstance(node.target, ast.Name):
+                    self.defined_vars.add(node.target.id)
+                self.generic_visit(node)
+
+            def visit_Assign(self, node: ast.Assign):
+                # Mark all assigned names as defined
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.defined_vars.add(target.id)
+                self.generic_visit(node)
+
+            def visit_AugAssign(self, node: ast.AugAssign):
+                # x += 1 requires x to be defined first
+                if isinstance(node.target, ast.Name):
+                    if (
+                        node.target.id not in self.defined_vars
+                        and node.target.id not in self.imported_modules
+                    ):
+                        self.used_before_def.add(node.target.id)
+                    self.defined_vars.add(node.target.id)
+                self.generic_visit(node)
+
+            def visit_Name(self, node: ast.Name):
+                # Check if variable is used before definition
+                if isinstance(node.ctx, ast.Load):
+                    # Skip common builtins and imports
+                    builtins = {
+                        "print",
+                        "len",
+                        "range",
+                        "str",
+                        "int",
+                        "float",
+                        "list",
+                        "dict",
+                        "set",
+                        "tuple",
+                        "True",
+                        "False",
+                        "None",
+                        "open",
+                        "input",
+                        "type",
+                        "isinstance",
+                        "hasattr",
+                        "getattr",
+                        "setattr",
+                        "__name__",
+                        "__main__",
+                    }
+                    if (
+                        node.id not in self.defined_vars
+                        and node.id not in builtins
+                        and node.id not in self.imported_modules
+                    ):
+                        self.used_before_def.add(node.id)
+                self.generic_visit(node)
+
+        visitor = VariableVisitor()
+        visitor.visit(tree)
+
+        # Report variables that might be used before definition
+        # Filter out common false positives
+        for var in visitor.used_before_def:
+            # Skip if it looks like it might be a module attribute
+            if var in visitor.imported_modules:
+                continue
+
+            issues.append(
+                ValidationIssue(
+                    severity="warning",
+                    issue_type="undefined_variable",
+                    message=f"Variable '{var}' may be used before definition",
+                    suggestion=f"Ensure '{var}' is defined before use",
+                )
+            )
+
+        return issues
+
+    def suggest_fix(self, code: str, issue: ValidationIssue) -> Optional[str]:
+        """
+        Suggest a minimal fix for a validation issue.
+
+        Args:
+            code: Original code
+            issue: Validation issue to fix
+
+        Returns:
+            Fixed code or None if no automatic fix available
+        """
+        if issue.issue_type == "infinite_loop":
+            # Add iteration counter to while True loops
+            lines = code.split("\n")
+            fixed_lines = []
+            in_while_true = False
+            indent_level = 0
+
+            for i, line in enumerate(lines):
+                if "while True:" in line:
+                    in_while_true = True
+                    indent_level = len(line) - len(line.lstrip())
+                    # Add counter before while loop
+                    fixed_lines.append(f"{' ' * indent_level}_iteration_count = 0")
+                    fixed_lines.append(f"{' ' * indent_level}_max_iterations = 10000")
+                    fixed_lines.append(line)
+                    # Add counter check inside loop
+                    fixed_lines.append(f"{' ' * (indent_level + 4)}_iteration_count += 1")
+                    fixed_lines.append(
+                        f"{' ' * (indent_level + 4)}if _iteration_count >= _max_iterations:"
+                    )
+                    fixed_lines.append(f"{' ' * (indent_level + 8)}break")
+                    in_while_true = False
+                else:
+                    fixed_lines.append(line)
+
+            return "\n".join(fixed_lines)
+
+        elif issue.issue_type == "missing_timeout" and "socket" in code.lower():
+            # Add socket timeout
+            lines = code.split("\n")
+            fixed_lines = []
+
+            for line in lines:
+                fixed_lines.append(line)
+                if "socket.socket(" in line or "socket(" in line:
+                    indent = len(line) - len(line.lstrip())
+                    # Extract socket variable name
+                    match = re.search(r"(\w+)\s*=\s*socket", line)
+                    if match:
+                        sock_var = match.group(1)
+                        fixed_lines.append(f"{' ' * indent}{sock_var}.settimeout(30)")
+
+            return "\n".join(fixed_lines)
+
+        elif issue.issue_type == "blocking_call" and "input()" in code:
+            # Replace input() with hardcoded test value
+            fixed_code = re.sub(
+                r"(\w+)\s*=\s*input\([^)]*\)",
+                r'\1 = "test_input"  # Auto-replaced input() call',
+                code,
+            )
+            return fixed_code
+
+        return None
+
+
+class DirectCodeRunner:
+    """
+    Runs code directly on user's machine with full system access.
+
+    No sandbox isolation, no temp file restrictions, full pip installation support.
+    """
+
+    def __init__(self):
+        self.installed_packages: Set[str] = set()
+
+    def detect_missing_imports(self, code: str) -> List[str]:
+        """Detect imports that are not available in the current environment."""
+        missing_imports = []
+
+        # Common stdlib modules that don't need installation
+        stdlib_modules = {
+            "os",
+            "sys",
+            "re",
+            "json",
+            "time",
+            "datetime",
+            "pathlib",
+            "subprocess",
+            "threading",
+            "multiprocessing",
+            "queue",
+            "logging",
+            "tempfile",
+            "shutil",
+            "glob",
+            "urllib",
+            "http",
+            "email",
+            "xml",
+            "sqlite3",
+            "csv",
+            "configparser",
+            "argparse",
+            "getpass",
+            "platform",
+            "uuid",
+            "hashlib",
+            "hmac",
+            "secrets",
+            "base64",
+            "binascii",
+            "struct",
+            "codecs",
+            "io",
+            "collections",
+            "itertools",
+            "functools",
+            "operator",
+            "pickle",
+            "copy",
+            "pprint",
+            "reprlib",
+            "enum",
+            "abc",
+            "contextlib",
+            "weakref",
+            "types",
+            "copyreg",
+            "typing",
+            "warnings",
+            "dataclasses",
+            "ast",
+            "dis",
+            "tkinter",
+        }
+
+        # Find all import statements
+        import_patterns = [
+            r"^import\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+            r"^from\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+import",
+        ]
+
+        found_imports = set()
+        for line in code.split("\n"):
+            line = line.strip()
+            for pattern in import_patterns:
+                match = re.match(pattern, line)
+                if match:
+                    module_name = match.group(1)
+                    if module_name not in stdlib_modules:
+                        found_imports.add(module_name)
+
+        # Check which imports are actually missing
+        for module in found_imports:
+            try:
+                __import__(module)
+            except ImportError:
+                missing_imports.append(module)
+
+        return missing_imports
+
+    def install_missing_packages(self, missing_imports: List[str]) -> bool:
+        """Install missing packages using pip."""
+        if not missing_imports:
+            return True
+
+        logger.info(f"Installing missing packages: {missing_imports}")
+
+        for package in missing_imports:
+            try:
+                # Map common module names to pip package names
+                pip_package = self._get_pip_package_name(package)
+                if pip_package and pip_package not in self.installed_packages:
+                    logger.info(f"Installing {pip_package} for module {package}")
+
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", pip_package],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+
+                    if result.returncode == 0:
+                        self.installed_packages.add(pip_package)
+                        logger.info(f"Successfully installed {pip_package}")
+                    else:
+                        logger.warning(f"Failed to install {pip_package}: {result.stderr}")
+                        return False
+
+            except Exception as e:
+                logger.warning(f"Error installing package for {package}: {e}")
+                return False
+
+        return True
+
+    def _get_pip_package_name(self, module_name: str) -> Optional[str]:
+        """Map module name to pip package name."""
+        mapping = {
+            "cv2": "opencv-python",
+            "PIL": "pillow",
+            "bs4": "beautifulsoup4",
+            "sklearn": "scikit-learn",
+            "yaml": "pyyaml",
+            "yaml2": "pyyaml",
+            "plotly": "plotly",
+            "flask": "flask",
+            "django": "django",
+            "fastapi": "fastapi",
+            "sqlalchemy": "sqlalchemy",
+            "pymongo": "pymongo",
+            "redis": "redis",
+            "celery": "celery",
+            "pytest": "pytest",
+            "tensorflow": "tensorflow",
+            "torch": "torch",
+            "keras": "keras",
+            "seaborn": "seaborn",
+            "requests": "requests",
+            "beautifulsoup4": "beautifulsoup4",
+            "pygame": "pygame",
+            "numpy": "numpy",
+            "pandas": "pandas",
+            "matplotlib": "matplotlib",
+            "jinja2": "jinja2",
+            "click": "click",
+            "tqdm": "tqdm",
+            "psutil": "psutil",
+            "paramiko": "paramiko",
+            "socket": None,  # Built-in
+            "mcstatus": "mcstatus",
+        }
+        return mapping.get(module_name)
+
+    def run_direct_code_streaming(
+        self, code: str, script_path: Optional[Path] = None, timeout: int = 30
+    ) -> Generator[str, None, None]:
+        """
+        Run code directly with streaming output for real-time feedback.
+
+        Args:
+            code: Python code to execute
+            script_path: Optional path to save script (otherwise uses temp file)
+            timeout: Execution timeout in seconds
+
+        Yields:
+            Output lines as they arrive
+        """
+
+        # Detect and install missing packages
+        missing_imports = self.detect_missing_imports(code)
+        if missing_imports:
+            yield f"📦 Installing missing packages: {', '.join(missing_imports)}\n"
+            if not self.install_missing_packages(missing_imports):
+                yield f"❌ Failed to install required packages: {missing_imports}\n"
+                return
+
+        # Write code to file (Desktop if possible, otherwise temp)
+        if script_path is None:
+            script_path = self._get_execution_path()
+
+        try:
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text(code, encoding="utf-8")
+
+            yield f"🚀 Executing code directly: {script_path}\n"
+
+            # Execute directly with user's Python interpreter
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+            process = subprocess.Popen(
+                [sys.executable, str(script_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=creation_flags,
+            )
+
+            assert process.stdout is not None
+            assert process.stderr is not None
+
+            # Read output in real-time
+            while True:
+                # Check if there's data to read from stdout
+                try:
+                    readable, _, _ = select.select([process.stdout], [], [], 0.1)
+                    if readable:
+                        line = process.stdout.readline()
+                        if line:
+                            yield f"📤 {line.rstrip()}\n"
+                        else:
+                            break
+                    else:
+                        # Check if process has finished
+                        if process.poll() is not None:
+                            break
+                except Exception:
+                    # Handle case where stdout is closed
+                    break
+
+            # Check stderr too
+            try:
+                while True:
+                    line = process.stderr.readline()
+                    if line:
+                        yield f"⚠️ {line.rstrip()}\n"
+                    else:
+                        break
+            except Exception:
+                pass
+
+            exit_code = process.returncode or 0
+
+            if exit_code == 0:
+                yield "✅ Code executed successfully!\n"
+            else:
+                yield f"❌ Code failed with exit code {exit_code}\n"
+
+        except subprocess.TimeoutExpired:
+            yield f"⏰ Execution timed out after {timeout} seconds\n"
+            if "process" in locals():
+                process.kill()
+        except Exception as e:
+            yield f"❌ Execution failed: {str(e)}\n"
+
+    def run_direct_code(
+        self,
+        code: str,
+        script_path: Optional[Path] = None,
+        timeout: int = 30,
+        capture_output: bool = False,
+    ) -> tuple[int, str, str]:
+        """
+        Run code directly with full system access.
+
+        Args:
+            code: Python code to execute
+            script_path: Optional path to save script (otherwise uses temp file)
+            timeout: Execution timeout in seconds
+            capture_output: Whether to capture output (True) or stream it (False)
+
+        Returns:
+            Tuple of (exit_code, stdout, stderr)
+        """
+
+        # Detect and install missing packages
+        missing_imports = self.detect_missing_imports(code)
+        if missing_imports:
+            logger.info(f"Detected missing imports: {missing_imports}")
+            if not self.install_missing_packages(missing_imports):
+                return 1, "", f"Failed to install required packages: {missing_imports}"
+
+        # Write code to file (Desktop if possible, otherwise temp)
+        if script_path is None:
+            script_path = self._get_execution_path()
+
+        try:
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text(code, encoding="utf-8")
+
+            logger.info(f"Executing code directly: {script_path}")
+
+            # Execute directly with user's Python interpreter
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+            if capture_output:
+                result = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    creationflags=creation_flags,
+                )
+                return result.returncode, result.stdout or "", result.stderr or ""
+            else:
+                proc = subprocess.Popen(
+                    [sys.executable, str(script_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=creation_flags,
+                )
+                stdout, stderr = proc.communicate(timeout=timeout)
+                return proc.returncode or 0, stdout or "", stderr or ""
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Code execution timed out after {timeout}s")
+            return 124, "", f"Execution timed out after {timeout} seconds"
+        except Exception as e:
+            logger.error(f"Failed to execute code: {e}")
+            return 1, "", f"Execution failed: {str(e)}"
+
+    def _get_execution_path(self) -> Path:
+        """Get path for script execution (Desktop preferred, fallback to temp)."""
+        try:
+            desktop = Path.home() / "Desktop"
+            if desktop.exists() and os.access(desktop, os.W_OK):
+                timestamp = int(time.time())
+                return desktop / f"spectral_direct_{timestamp}.py"
+        except Exception:
+            pass
+
+        # Fallback to temp directory
+        return Path(tempfile.gettempdir()) / f"spectral_direct_{int(time.time())}.py"
 
 
 class DirectExecutor:
@@ -68,9 +1044,12 @@ class DirectExecutor:
         self.memory_module = memory_module
         self.gui_callback = gui_callback
         self.gui_test_generator = GUITestGenerator(llm_client)
-        self.sandbox_manager = SandboxRunManager()
+
+        # Use DirectCodeRunner for unrestricted execution
+        self.direct_runner = DirectCodeRunner()
+        self.code_validator = CodeValidator()
         self._execution_history: list[ExecutionMemory] = []
-        logger.info("DirectExecutor initialized with sandbox verification")
+        logger.info("DirectExecutor initialized with direct code execution (no sandbox)")
 
     def _emit_gui_event(self, event_type: str, data: dict) -> None:
         """
@@ -431,27 +1410,29 @@ class DirectExecutor:
         timeout: int = 30,
         max_attempts: Optional[int] = None,
     ) -> Generator[str, None, None]:
-        """Execute a user request end-to-end with sandbox verification.
+        """Execute a user request end-to-end with direct execution (no sandbox).
 
-        Retry behavior is bounded and loop-aware:
-        - If the user doesn't specify a limit, attempts are capped at 15.
-        - If the same error repeats several times, retries stop early to avoid loops.
-
-        Uses SandboxRunManager for isolated verification before desktop export.
+        Smart retry behavior (max 3-5 attempts):
+        - Retries only on actual code generation errors (syntax, logic)
+        - Skips retry for permission/privilege errors
+        - Skips retry for environment setup (installs packages and runs again)
+        - Limits retries to prevent infinite loops
         """
 
-        logger.info(f"Executing request: {user_request}")
+        logger.info(f"Executing request with direct execution: {user_request}")
 
         if max_attempts is None:
             parsed = parse_retry_limit(user_request)
-            max_attempts = parsed if parsed is not None else 15
+            max_attempts = parsed if parsed is not None else 5
+
+        # Cap maximum attempts to prevent infinite loops
+        max_attempts = min(max_attempts, 5)
 
         retry_manager = IntelligentRetryManager(max_retries=max_attempts, error_repeat_threshold=3)
 
         code: Optional[str] = None
         last_error_output = ""
         desktop_path: Optional[Path] = None
-        run_id: Optional[str] = None
         target_filename = self._generate_safe_filename(user_request) + ".py"
 
         while True:
@@ -498,173 +1479,203 @@ class DirectExecutor:
                 if has_interactive:
                     yield f"🔍 Detected {input_count} input() call(s)\n"
 
-                # Create sandbox run for verification
-                if run_id is None:
-                    run_id = self.sandbox_manager.create_run()
+                # Validate code before execution
+                yield "🔍 Validating code for common issues...\n"
+                validation_result = self.code_validator.validate(code)
 
-                yield f"🔒 Creating isolated sandbox: {run_id}\n"
+                # Show what was checked
+                if validation_result.checks_performed:
+                    checks = ", ".join(validation_result.checks_performed)
+                    yield f"   ✓ Checks performed: {checks}\n"
 
-                # Prepare stdin data for interactive programs
-                stdin_data = None
-                if has_interactive:
-                    test_inputs = generate_test_inputs(prompts)
-                    stdin_data = "\n".join(test_inputs) + "\n"
-                    yield f"   Generated test inputs: {test_inputs}\n"
+                # Handle validation issues
+                if validation_result.issues:
+                    # Show warnings (non-blocking)
+                    warnings = validation_result.get_warning_messages()
+                    if warnings:
+                        for warning in warnings:
+                            yield f"   ⚠️ Warning: {warning}\n"
 
-                # Run verification pipeline
-                yield "🔍 Running verification pipeline...\n"
-                yield "   Gate 1: Syntax check\n"
-                yield "   Gate 2: Test execution\n"
-                yield "   Gate 3: Smoke test\n\n"
+                    # Show errors (blocking)
+                    errors = validation_result.get_error_messages()
+                    if errors:
+                        yield f"\n❌ Validation found {len(errors)} critical issue(s):\n"
+                        for error in errors:
+                            yield f"   • {error}\n"
 
-                # Detect GUI program
-                is_gui, framework = self.gui_test_generator.detect_gui_program(code)
+                        # Attempt ONE fix for the first error
+                        if attempt == 1:
+                            yield "\n🔧 Attempting automatic fix...\n"
+                            first_error = next(
+                                (
+                                    issue
+                                    for issue in validation_result.issues
+                                    if issue.severity == "error"
+                                ),
+                                None,
+                            )
+                            if first_error:
+                                fixed_code = self.code_validator.suggest_fix(code, first_error)
+                                if fixed_code:
+                                    code = fixed_code
+                                    yield f"   ✓ Applied fix: {first_error.suggestion}\n"
+                                    yield "   ↻ Re-validating fixed code...\n"
+                                    # Re-validate
+                                    validation_result = self.code_validator.validate(code)
+                                    if validation_result.has_errors():
+                                        yield "   ❌ Fix did not resolve all issues\n"
+                                        last_error_output = "\n".join(
+                                            validation_result.get_error_messages()
+                                        )
+                                        retry_manager.register_failure(last_error_output)
+                                        continue
+                                    else:
+                                        yield "   ✓ Code validation passed after fix\n\n"
+                                else:
+                                    yield "   ⚠️ No automatic fix available\n"
+                                    yield "   ❌ Aborting execution due to validation errors\n"
+                                    last_error_output = "\n".join(errors)
+                                    return
+                        else:
+                            # Already tried fixing, abort
+                            yield "\n❌ Code still has validation errors after fix attempt\n"
+                            yield "   Aborting to prevent timeout/hang\n"
+                            last_error_output = "\n".join(errors)
+                            return
+                else:
+                    yield "   ✓ Validation passed - no issues found\n\n"
 
-                # For GUI programs, we may need to regenerate with test_mode contract
-                if is_gui and framework:
-                    yield f"🎨 Detected GUI program ({framework})\n"
-                    yield "   Enforcing test_mode contract for verification\n"
+                # Save to Desktop first
+                yield "💾 Saving code to Desktop...\n"
+                try:
+                    desktop_path = self.save_code_to_desktop(
+                        code, user_request, filename=target_filename
+                    )
+                    yield f"   ✓ Saved to: {desktop_path}\n\n"
+                except Exception as e:
+                    yield f"   ⚠️ Could not save to Desktop: {e}\n"
+                    # Continue with execution anyway
 
-                # Execute sandbox verification
-                result = self.sandbox_manager.execute_verification_pipeline(
-                    run_id=run_id,
-                    code=code,
-                    filename=target_filename,
-                    is_gui=is_gui,
-                    stdin_data=stdin_data,
+                # Execute code directly with full system access
+                yield "🚀 Executing code directly (no sandbox restrictions)...\n"
+
+                # Check for common environment/setup errors that don't need retries
+                if last_error_output:
+                    if any(
+                        err in last_error_output.lower()
+                        for err in [
+                            "permission denied",
+                            "access is denied",
+                            "admin",
+                            "privilege",
+                            "not enough storage",
+                            "disk space",
+                        ]
+                    ):
+                        yield "⚠️ Permission/environment error detected\n"
+                        yield "💡 Note: Some operations may require admin privileges\n"
+                        # Continue with execution anyway
+
+                # Use DirectCodeRunner for unrestricted execution
+                exit_code, stdout, stderr = self.direct_runner.run_direct_code(
+                    code=code, script_path=desktop_path, timeout=timeout, capture_output=True
                 )
 
-                # Check verification results
-                yield "📊 Verification Results:\n"
-                for gate, passed in result.gates_passed.items():
-                    status = "✅ PASS" if passed else "❌ FAIL"
-                    yield f"   {gate.title()}: {status}\n"
-                yield "\n"
+                # Stream the captured output
+                if stdout:
+                    for line in stdout.splitlines():
+                        yield f"📤 {line}\n"
+                if stderr:
+                    for line in stderr.splitlines():
+                        yield f"⚠️ {line}\n"
 
-                if result.status == "success":
-                    yield "✅ All verification gates passed!\n\n"
+                # Check execution result
+                if exit_code == 0:
+                    yield "✅ Code executed successfully!\n\n"
 
-                    # Export to desktop
-                    yield "💾 Exporting verified code to Desktop...\n"
-                    desktop_path = None
-                    try:
-                        desktop_path = self.save_code_to_desktop(
-                            code, user_request, result.code_path, filename=target_filename
-                        )
-                        yield f"   ✓ Saved to: {desktop_path}\n"
-                    except Exception as e:
-                        yield f"   ⚠️  Could not save to Desktop: {e}\n"
+                    # After execution completes, extract file locations and save metadata
+                    yield "\n"
 
                     # Extract actual file locations (Desktop paths)
                     file_locations = self._extract_file_locations(
                         user_request, desktop_path, target_filename
                     )
 
-                    # Save run metadata
-                    self.sandbox_manager.save_run_metadata(run_id, result)
-
-                    # Save comprehensive execution metadata with file_locations
+                    # Save execution metadata (simplified - no sandbox verification needed)
                     execution_metadata = {
-                        "run_id": run_id,
                         "timestamp": datetime.now().isoformat(),
                         "prompt": user_request,
                         "filename": target_filename,
                         "desktop_path": str(desktop_path) if desktop_path else None,
-                        "sandbox_path": str(result.code_path),
                         "code": code,
                         "execution_status": "success",
-                        "execution_output": result.log_stdout,
-                        "execution_error": result.log_stderr,
                         "attempts": attempt,
                         "last_error": None,
-                        "file_locations": file_locations,  # Include actual file paths
+                        "file_locations": file_locations,
+                        "execution_mode": "direct",  # Mark as direct execution
                     }
-                    self.sandbox_manager.save_execution_metadata(execution_metadata)
 
-                    # Save to memory
+                    # Save to memory if available
                     if self.memory_module:
-                        self._save_execution_to_memory(
-                            user_request, code, desktop_path, result, is_gui
-                        )
+                        try:
+                            self._save_execution_to_memory(
+                                user_request, code, desktop_path, None, False  # No sandbox result
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to save to memory: {e}")
 
-                    # Clean up sandbox
-                    self.sandbox_manager.cleanup_run(run_id)
-
-                    yield "\n🎉 Code successfully verified and exported!\n"
+                    yield "🎉 Code successfully executed and exported!\n"
                     return
-
-                # Verification failed, handle different failure types
-                yield f"❌ Verification failed: {result.status}\n"
-
-                if result.error_message:
-                    yield f"Error: {result.error_message}\n\n"
-
-                if result.status == "syntax_error":
-                    yield "🔧 Fixing syntax error and retrying...\n"
-                    last_error_output = result.error_message or ""
-                elif result.status == "test_failure":
-                    yield "🔧 Tests failed, regenerating with fixes...\n"
-                    last_error_output = result.pytest_summary or result.error_message or ""
-                elif result.status == "timeout":
-                    yield "🔧 Execution timeout, optimizing code...\n"
-                    last_error_output = (
-                        "Execution timeout - code may have infinite loops or blocking calls"
-                    )
                 else:
-                    yield "🔧 Code verification failed, regenerating...\n"
-                    last_error_output = result.error_message or ""
+                    # Execution failed
+                    last_error_output = f"Exit code {exit_code}\n{stdout}\n{stderr}"
+                    yield f"❌ Execution failed (attempt {attempt})\n"
 
-                # Save metadata for failed execution
-                execution_metadata = {
-                    "run_id": run_id,
-                    "timestamp": datetime.now().isoformat(),
-                    "prompt": user_request,
-                    "filename": target_filename,
-                    "desktop_path": None,
-                    "sandbox_path": str(result.code_path),
-                    "code": code,
-                    "execution_status": "failed",
-                    "execution_output": result.log_stdout,
-                    "execution_error": result.log_stderr,
-                    "attempts": attempt,
-                    "last_error": last_error_output or result.status,
-                }
-                self.sandbox_manager.save_execution_metadata(execution_metadata)
+                    # Smart error classification for retry logic
+                    error_lower = last_error_output.lower()
 
-                retry_manager.record_error(last_error_output or result.status)
+                    # Skip retry for permission/privilege errors
+                    if any(
+                        err in error_lower
+                        for err in [
+                            "permission denied",
+                            "access is denied",
+                            "admin",
+                            "privilege",
+                            "not enough storage",
+                            "disk space",
+                            "cannot write to",
+                        ]
+                    ):
+                        yield f"⚠️ Permission/environment error - not retrying\n"
+                        yield f"Error: {last_error_output[:200]}\n"
+                        return
 
-                # Clean up failed run
-                self.sandbox_manager.cleanup_run(run_id)
-                run_id = None  # Create new run for retry
-
-                # If the repeated error detector thinks we're stuck, stop now.
-                post_fail_decision = retry_manager.should_retry()
-                if not post_fail_decision.should_retry:
-                    reason = post_fail_decision.reason or "retry budget exhausted"
-                    yield f"\n❌ Stopping retries: {reason}\n"
-                    if last_error_output:
-                        yield f"Last error:\n{last_error_output}\n"
-                    return
-
-                yield "🔄 Retrying...\n\n"
-                continue
+                    # Skip retry for environment setup (missing packages will be auto-installed)
+                    if any(
+                        err in error_lower
+                        for err in ["no module named", "import error", "module not found"]
+                    ):
+                        yield "🔧 Environment setup issue - will auto-install packages on next attempt\n\n"
+                        # Continue to next attempt which will auto-install packages
+                    else:
+                        # Actual code error - continue with retry
+                        yield f"Error details: {last_error_output[:300]}\n\n"
 
             except Exception as e:
-                logger.error(f"Execution failed: {e}")
-                yield f"\n❌ Execution error: {str(e)}\n"
+                logger.error(f"Failed to execute request: {e}")
+                last_error_output = f"Execution error: {str(e)}\n{traceback.format_exc()}"
+                yield f"❌ Execution error: {str(e)}\n\n"
 
-                # Clean up on error
-                if run_id:
-                    self.sandbox_manager.cleanup_run(run_id)
-
-                return
+        # This should never be reached, but just in case
+        yield "❌ Maximum attempts exceeded\n"
 
     def _save_execution_to_memory(
         self,
         user_request: str,
         code: str,
         desktop_path: Optional[Path],
-        result: SandboxResult,
+        result,  # No longer used, kept for compatibility
         is_gui: bool,
     ) -> None:
         """
@@ -674,23 +1685,33 @@ class DirectExecutor:
             user_request: Original user request
             code: Generated code
             desktop_path: Path where code was saved
-            result: Sandbox verification result
+            result: No longer used (sandbox result) - kept for compatibility
             is_gui: Whether this was a GUI program
         """
         if not self.memory_module:
             return
 
         try:
-            file_locations = [str(result.code_path)]
+            file_locations = []
             if desktop_path:
                 file_locations.append(str(desktop_path))
 
-            # Add test files if they exist
-            for test_path in result.test_paths:
-                file_locations.append(str(test_path))
+            # Add Desktop path if it exists and was successfully created
+            if desktop_path and Path(desktop_path).exists():
+                file_locations.append(str(desktop_path))
 
+            # Also check for other files that might have been created
+            desktop = Path.home() / "Desktop"
+            if desktop.exists():
+                # Look for spectral files on Desktop
+                for file_path in desktop.iterdir():
+                    if file_path.is_file() and "spectral" in file_path.name.lower():
+                        if str(file_path) not in file_locations:
+                            file_locations.append(str(file_path))
+
+            # Generate description
             description = self._generate_description(user_request, code)
-            tags = ["python", "sandbox_verification"]
+            tags = ["python", "direct_execution"]
             if is_gui:
                 tags.append("gui")
             else:
@@ -701,12 +1722,12 @@ class DirectExecutor:
                 description=description,
                 code_generated=code,
                 file_locations=file_locations,
-                output=f"Sandbox verification passed in {result.duration_seconds:.2f}s",
+                output="Direct execution completed successfully",
                 success=True,
                 tags=tags,
             )
 
-            logger.info(f"Saved sandbox execution to memory: {execution_id}")
+            logger.info(f"Saved direct execution to memory: {execution_id}")
 
         except Exception as e:
             logger.error(f"Failed to save execution to memory: {e}")
@@ -876,60 +1897,180 @@ class DirectExecutor:
         Returns:
             Fixed code
         """
+        import getpass
+
+        username = getpass.getuser()
+
         # Check if error is from test failures
         is_test_failure = "GUI Tests Failed" in error_output or "FAILED" in error_output
 
         if is_test_failure:
             prompt = f"""{AUTONOMOUS_CODE_REQUIREMENT}
 
-The following {language} GUI code failed automated tests:
+═══════════════════════════════════════════════════════════════════════════════
+🔧 CODE FIX REQUEST - GUI Test Failures
+═══════════════════════════════════════════════════════════════════════════════
 
-Request: {user_request}
+Original Request: {user_request}
 Attempt: {attempt}
+Language: {language}
 
-Test Results:
+TEST RESULTS (What went wrong):
 {error_output[:1500]}
 
-Previous Code:
+PREVIOUS CODE (That failed):
+```python
 {previous_code[:1500]}
+```
+
+═══════════════════════════════════════════════════════════════════════════════
+🎯 YOUR TASK: Generate WORKING, TESTED code
+═══════════════════════════════════════════════════════════════════════════════
 
 The automated tests verify:
-- Program initialization
-- UI element creation
-- Event handlers work correctly
-- State changes happen as expected
-- Randomization/variety in behavior
+✓ Program initialization succeeds
+✓ UI elements are created properly
+✓ Event handlers work correctly
+✓ State changes happen as expected
+✓ Randomization/variety functions properly
 
-Analyze the test failures and provide a FIXED version that:
-1. Addresses the specific test failures
-2. Ensures all UI elements are properly created and accessible
-3. Makes sure event handlers are connected and functional
-4. Implements proper state management
-5. Includes variety/randomization where needed
-6. Can be tested programmatically (mock mainloop, testable methods)
-7. Uses hard-coded inputs instead of input()
+You have FULL SYSTEM ACCESS. Generate COMPLETE, WORKING code that:
 
-Return ONLY the complete fixed code, no markdown formatting."""
+1. FIXES THE ROOT CAUSE:
+   - Analyze the exact test failure
+   - Identify what's missing or broken
+   - Fix it completely, not partially
+
+2. ENSURES COMPLETENESS:
+   - All UI elements properly created and accessible
+   - Event handlers connected and functional
+   - State management works correctly
+   - Variety/randomization implemented (if needed)
+   - Code can be tested programmatically
+
+3. MAINTAINS QUALITY:
+   - Proper error handling with try/except
+   - Clear comments explaining the fix
+   - Hard-coded test inputs (NO input() calls)
+   - Follows GUI best practices
+   - Desktop save location: C:\\Users\\{username}\\Desktop
+
+4. VERIFICATION:
+   Before returning, verify:
+   ✓ All test requirements are addressed
+   ✓ No infinite loops or blocking calls
+   ✓ Proper timeouts on async operations
+   ✓ All imports are correct
+   ✓ Code is immediately executable
+
+═══════════════════════════════════════════════════════════════════════════════
+📤 OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════════════════════
+
+Return ONLY the complete fixed Python code wrapped in a single code block:
+
+```python
+# complete fixed code
+```
+
+Rules:
+- Exactly ONE ```python ... ``` block
+- No text before or after
+- No explanations outside the code
+- Code must work on first execution"""
         else:
             prompt = f"""{AUTONOMOUS_CODE_REQUIREMENT}
 
-The following {language} code failed:
+═══════════════════════════════════════════════════════════════════════════════
+🔧 CODE FIX REQUEST - Execution Error
+═══════════════════════════════════════════════════════════════════════════════
 
-Request: {user_request}
+Original Request: {user_request}
 Attempt: {attempt}
-Error: {error_output}
+Language: {language}
 
-Previous Code:
+ERROR OUTPUT (What went wrong):
+{error_output[:1000]}
+
+PREVIOUS CODE (That failed):
+```python
 {previous_code[:1000]}
+```
 
-Analyze the error and provide a FIXED version that:
-1. Addresses the specific error
-2. Maintains the original intent
-3. Uses proper error handling
-4. Includes comments explaining the fix
-5. Uses hard-coded inputs instead of input()
+═══════════════════════════════════════════════════════════════════════════════
+🎯 YOUR TASK: Generate WORKING code
+═══════════════════════════════════════════════════════════════════════════════
 
-Return ONLY the complete fixed code, no markdown formatting."""
+You have FULL SYSTEM ACCESS. Analyze the error and generate COMPLETE, WORKING code:
+
+1. FIX THE ERROR:
+   - Identify the root cause (syntax, logic, import, runtime)
+   - Fix it properly, not with workarounds
+   - Ensure the fix doesn't break other parts
+
+2. IMPROVE ROBUSTNESS:
+   - Add proper error handling (try/except blocks)
+   - Include timeouts for I/O operations
+   - Handle edge cases that caused failure
+   - Add logging/debug prints
+
+3. MAINTAIN FUNCTIONALITY:
+   - Keep the original intent
+   - Implement ALL required features
+   - Use hard-coded test values (NO input() calls)
+   - Save files to: C:\\Users\\{username}\\Desktop
+
+4. COMMON ERROR FIXES:
+
+   ImportError/ModuleNotFoundError:
+   - Check import spelling
+   - Use correct package names
+   - Packages will be auto-installed
+
+   SyntaxError:
+   - Fix indentation
+   - Check for unclosed brackets/quotes
+   - Verify proper Python syntax
+
+   RuntimeError/TypeError:
+   - Check variable types
+   - Add type conversions
+   - Verify function signatures
+
+   TimeoutError:
+   - Add socket.settimeout() for networking
+   - Use requests with timeout parameter
+   - Add thread.join(timeout=30)
+
+   FileNotFoundError:
+   - Check paths use Windows format
+   - Verify files exist before reading
+   - Use pathlib.Path for paths
+
+5. VERIFICATION CHECKLIST:
+   Before returning, verify:
+   ✓ Error is completely fixed
+   ✓ All imports are correct
+   ✓ No infinite loops
+   ✓ Proper error handling
+   ✓ Timeouts where needed
+   ✓ Code is complete and runnable
+
+═══════════════════════════════════════════════════════════════════════════════
+📤 OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════════════════════
+
+Return ONLY the complete fixed Python code wrapped in a single code block:
+
+```python
+# complete fixed code
+```
+
+Rules:
+- Exactly ONE ```python ... ``` block
+- No text before or after
+- No explanations outside the code
+- Code must work on first execution"""
 
         try:
             code = self.llm_client.generate(prompt)
@@ -971,50 +2112,170 @@ Return ONLY the complete fixed code, no markdown formatting."""
 Task: Write a {language} script that does the following:
 {user_request}
 
-Remember:
-- Hard-code all input values
-- No input() calls
-- Code must run autonomously
-- Produce output immediately
+═══════════════════════════════════════════════════════════════════════════════
+🔓 FULL SYSTEM ACCESS AVAILABLE
+═══════════════════════════════════════════════════════════════════════════════
 
-IMPORTANT: You are running on Windows. Always use Windows paths:
+You have COMPLETE, UNRESTRICTED access to the user's system:
+
+✅ FILESYSTEM ACCESS:
+   - Read/write ANY files in ANY directory
+   - Access user's entire filesystem (C:\\Users\\{username}\\)
+   - Create/modify/delete files and directories
+
+✅ NETWORK ACCESS:
+   - Create raw socket connections
+   - Make HTTP/HTTPS requests
+   - Connect to any IP/port without restrictions
+   - Use websockets, FTP, SSH, etc.
+
+✅ SYSTEM COMMANDS:
+   - Execute subprocess commands
+   - Run PowerShell scripts
+   - Use os.system(), subprocess.run(), etc.
+   - Access system utilities and tools
+
+✅ PACKAGE INSTALLATION:
+   - ANY missing packages will be auto-installed via pip
+   - Use numpy, pandas, requests, pillow, opencv, etc. freely
+   - No package restrictions whatsoever
+
+✅ OS FEATURES:
+   - Environment variables
+   - System registry (Windows)
+   - Process management
+   - Thread/async operations
+
+═══════════════════════════════════════════════════════════════════════════════
+📋 CODE GENERATION REQUIREMENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+Generate COMPLETE, WORKING code that will execute successfully on first try.
+
+1. COMPLETENESS:
+   - Write FULL implementation, not pseudo-code or partial solutions
+   - Include ALL necessary imports at the top
+   - Implement ALL functions and classes completely
+   - No TODO comments or placeholder functions
+   - Code must be immediately executable
+
+2. IMPORTS & DEPENDENCIES:
+   - Import ALL required modules (they'll be auto-installed if missing)
+   - Prefer standard library when possible: os, sys, json, re, pathlib, subprocess
+   - Use external packages when appropriate: requests, pillow, numpy, pandas
+   - Verify imports are spelled correctly
+
+3. ERROR HANDLING:
+   - Wrap risky operations in try/except blocks
+   - Handle file not found, network errors, permission errors
+   - Log errors with clear messages
+   - Include retry logic for network operations (with timeouts)
+
+4. AUTONOMY (CRITICAL):
+   - Hard-code ALL input values - NO input() calls ever
+   - For test data: use realistic hardcoded examples
+   - No interactive prompts or user input required
+   - Code must run completely unattended
+
+5. OUTPUT & LOGGING:
+   - Print progress messages during execution
+   - Show results immediately
+   - Save files to Desktop: C:\\Users\\{username}\\Desktop
+   - Log what the code is doing
+
+6. TASK-SPECIFIC BEST PRACTICES:
+
+   THREADING/ASYNC:
+   - Set timeouts on thread.join() and async operations
+   - Include proper shutdown handlers
+   - Clean up resources in finally blocks
+   - Use threading.Event() or asyncio.wait_for() with timeouts
+
+   NETWORKING:
+   - ALWAYS set socket timeouts: sock.settimeout(30)
+   - Include error handling for connection failures
+   - Use requests library with timeout parameter: requests.get(url, timeout=10)
+   - Log all network activity
+
+   FILE I/O:
+   - Use pathlib.Path for cross-platform paths
+   - Always use 'with' context managers for file operations
+   - Check if files exist before reading: Path(file).exists()
+   - Handle permission errors gracefully
+
+   SYSTEM CALLS:
+   - Use subprocess.run() with timeout parameter
+   - Capture output with capture_output=True
+   - Handle errors with proper exception catching
+   - Use shell=True only when necessary
+
+═══════════════════════════════════════════════════════════════════════════════
+🔍 PRE-GENERATION VERIFICATION CHECKLIST
+═══════════════════════════════════════════════════════════════════════════════
+
+Before returning code, verify:
+✓ All imports are standard library or common packages (will be auto-installed)
+✓ All function calls have proper error handling (try/except)
+✓ All loops have clear exit conditions (no infinite loops)
+✓ All I/O operations have timeouts where applicable (sockets, requests, threads)
+✓ Code is complete and immediately runnable (not pseudo-code)
+✓ No input() calls or interactive prompts
+✓ All test values are hardcoded
+✓ File paths use Windows format or pathlib
+
+═══════════════════════════════════════════════════════════════════════════════
+🖥️ WINDOWS ENVIRONMENT DETAILS
+═══════════════════════════════════════════════════════════════════════════════
+
 - Home directory: C:\\Users\\{username}
-- Desktop: C:\\Users\\{username}\\Desktop
+- Desktop: C:\\Users\\{username}\\Desktop  
 - Temp: C:\\Users\\{username}\\AppData\\Local\\Temp
+- Documents: C:\\Users\\{username}\\Documents
 
-NEVER use:
-- /path/to/... (Unix paths)
-- /usr/bin, /home, /var (Unix directories)
-- Relative paths like './data' (use full Windows paths)
+Path handling:
+- Use pathlib.Path for cross-platform compatibility
+- Or use raw strings: r'C:\\path\\to\\file'
+- Or double backslashes: 'C:\\\\path\\\\to\\\\file'
+- Use os.path.expanduser('~') for home directory
+- Use os.path.join() or Path() for path construction
 
-For file operations, use:
-- os.path.expanduser('~') for home directory
-- os.path.join() for path construction
-- Always use backslashes or raw strings: r'C:\\path\\to\\file'
+═══════════════════════════════════════════════════════════════════════════════
+🎯 EXECUTION CONTEXT
+═══════════════════════════════════════════════════════════════════════════════
 
-General Requirements:
-- Write complete, executable code
-- Include proper error handling
-- Add comments explaining the code
-- Make it production-ready
-- No extra text or explanations, just code
-- IMPORTANT: For interactive programs, use hard-coded values NOT input()
-- IMPORTANT (GUI programs): if you use tkinter/pygame/PyQt/kivy, structure:
-  - Do NOT create or show any GUI windows at import time
-  - Put main loop / window launch code under if __name__ == "__main__":
-  - Encapsulate state + event handlers in a class
-  - Keep UI separate from core logic so tests can verify state changes
-- No markdown formatting, no explanations."""
+Your code will be:
+1. Executed IMMEDIATELY after generation
+2. Run with the user's Python interpreter (full system access)
+3. Given 30 seconds to complete (unless it's a long-running service)
+4. Tested with the hardcoded values you provide
+
+Generate code that works on FIRST execution, not code that needs debugging.
+
+═══════════════════════════════════════════════════════════════════════════════
+📤 OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════════════════════
+
+Return ONLY valid Python code wrapped in a SINGLE Python code block.
+
+REQUIRED output shape:
+```python
+# your complete, runnable code here
+```
+
+Rules:
+- Exactly ONE ```python ... ``` block
+- No text before or after the code block
+- No explanations, no pseudocode
+- Code must be immediately executable as-is"""
 
         # Inject learned patterns
         if learned_patterns:
-            prompt += "\n\nBased on previous mistakes, also include:\n"
+            prompt += "\n\n═══════════════════════════════════════════════════════════════════════════════\n"
+            prompt += "📚 LEARNED PATTERNS (Apply these to avoid past mistakes)\n"
+            prompt += "═══════════════════════════════════════════════════════════════════════════════\n\n"
             for i, pattern in enumerate(learned_patterns[:5], 1):
-                prompt += f"{i}. For {pattern.get('error_type')}: {pattern.get('fix_applied')}\n"
-            prompt += "\nApply these patterns to avoid of same errors.\n"
+                prompt += f"{i}. {pattern.get('error_type')}: {pattern.get('fix_applied')}\n"
 
-        prompt += """
-        Return only code, no markdown formatting, no explanations."""
         return prompt
 
     def _generate_description(self, user_request: str, code: str) -> str:
