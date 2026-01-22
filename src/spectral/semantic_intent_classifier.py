@@ -260,9 +260,7 @@ Reason: [brief explanation]"""
         intent = max(scores, key=scores.get)
         confidence = min(0.7, 0.4 + max_score * 0.1)
 
-        logger.info(
-            f"Fallback classification: {intent.value} (score: {max_score}, confidence: {confidence:.2f})"
-        )
+        logger.info(f"Fallback classification: {intent.value} (score: {max_score}, confidence: {confidence:.2f})")
 
         return intent, confidence
 
@@ -331,9 +329,7 @@ Reason: [brief explanation]"""
 
         return "Could you please clarify what you'd like me to do?"
 
-    def classify_with_clarification(
-        self, user_input: str
-    ) -> Tuple[SemanticIntent, float, Optional[str]]:
+    def classify_with_clarification(self, user_input: str) -> Tuple[SemanticIntent, float, Optional[str]]:
         """
         Classify intent and optionally return a clarification question.
 

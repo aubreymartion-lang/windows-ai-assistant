@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """
 Test script for Semantic Intent Detection and Pentesting Assistant.
-
-Validates implementation against 5 test scenarios:
-1. Typo tolerance
-2. Hardcoded shortcuts prevention
-3. Autonomous execution readiness
-4. Context memory
-5. Consistent execution pipeline
 """
 
 import sys
 from pathlib import Path
-
-# Add src to path - must be before other imports
-sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from spectral.pentesting_assistant import ExploitStage, PentestingAssistant
 from spectral.semantic_intent_classifier import (
     SemanticIntent,
     SemanticIntentClassifier,
 )
+
+# Add src to path - must be before other imports
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 
 def test_typo_tolerance():
@@ -29,7 +22,6 @@ def test_typo_tolerance():
     print("TEST 1: Typo Tolerance")
     print("=" * 70)
 
-    # Create classifier (will use fallback since LLM might not be configured)
     classifier = SemanticIntentClassifier(llm_client=None)
 
     test_cases = [
@@ -50,7 +42,8 @@ def test_typo_tolerance():
     for user_input, expected_intent, description in test_cases:
         detected_intent, confidence = classifier.classify(user_input)
         passed = detected_intent == expected_intent
-        status = "✅ PASS" if passed else "❌ FAIL"
+        status = "PASS" if passed else "FAIL"
+
         print(f"\n{status}: {description}")
         print(f"  Input: '{user_input}'")
         print(f"  Expected: {expected_intent.value}")
@@ -68,7 +61,6 @@ def test_no_hardcoded_shortcuts():
     print("TEST 2: Hardcoded Shortcuts Prevention")
     print("=" * 70)
 
-    # Create assistant (will use fallback LLM)
     classifier = SemanticIntentClassifier(llm_client=None)
     assistant = PentestingAssistant(
         llm_client=None,
@@ -108,12 +100,10 @@ def test_no_hardcoded_shortcuts():
 
     # At early stage, should have questions and no instant code
     if assistant.stage == ExploitStage.RECONNAISSANCE and has_questions and not has_instant_code:
-        print("✅ PASS: Correctly asks questions, no instant payload generation")
+        print("PASS: Correctly asks questions, no instant payload generation")
         return True
     else:
-        print(
-            f"❌ FAIL: Stage={assistant.stage}, has_questions={has_questions}, has_instant_code={has_instant_code}"
-        )
+        print(f"FAIL: Stage={assistant.stage}, has_questions={has_questions}")
         return False
 
 
@@ -144,10 +134,10 @@ def test_context_memory():
     print(f"Stage after clear: {assistant.stage}")
 
     if assistant.target is None and assistant.stage == ExploitStage.RECONNAISSANCE:
-        print("\n✅ PASS: Context cleared successfully")
+        print("\nPASS: Context cleared successfully")
         return True
     else:
-        print(f"\n❌ FAIL: Target={assistant.target}, Stage={assistant.stage}")
+        print(f"\nFAIL: Target={assistant.target}, Stage={assistant.stage}")
         return False
 
 
@@ -205,10 +195,10 @@ def test_methodology_stages():
 
     # Just verify we didn't jump straight to exploitation
     if assistant.stage in stages_visited:
-        print("\n✅ PASS: Methodology stages followed, no premature exploitation")
+        print("\nPASS: Methodology stages followed, no premature exploitation")
         return True
     else:
-        print(f"\n❌ FAIL: Unexpected stage {assistant.stage}")
+        print(f"\nFAIL: Unexpected stage {assistant.stage}")
         return False
 
 
@@ -249,7 +239,7 @@ def test_semantic_classification():
     for user_input, expected_intent, description in test_cases:
         detected_intent, confidence = classifier.classify(user_input)
         passed = detected_intent == expected_intent
-        status = "✅" if passed else "❌"
+        status = "PASS" if passed else "FAIL"
 
         print(f"\n{status} {description}")
         print(f"  Input: '{user_input}'")
@@ -281,7 +271,7 @@ def main():
     print("=" * 70)
 
     for test_name, passed in results.items():
-        status = "✅ PASS" if passed else "❌ FAIL"
+        status = "PASS" if passed else "FAIL"
         print(f"{status}: {test_name}")
 
     total_tests = len(results)
@@ -290,10 +280,10 @@ def main():
     print(f"\nPassed: {passed_tests}/{total_tests}")
 
     if passed_tests == total_tests:
-        print("\n🎉 ALL TESTS PASSED!")
+        print("\nALL TESTS PASSED!")
         return 0
     else:
-        print(f"\n⚠️  {total_tests - passed_tests} test(s) failed")
+        print(f"\n{total_tests - passed_tests} test(s) failed")
         return 1
 
 
