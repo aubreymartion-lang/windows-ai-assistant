@@ -903,6 +903,42 @@ class ChatSession:
 
             return response
 
+        # Try dual execution orchestrator for action/code intents
+        if self.dual_execution_orchestrator:
+            # Use semantic intent classifier
+            semantic_intent, confidence = self.semantic_classifier.classify(user_input)
+            
+            # Check if this should use dual execution
+            should_use_dual_exec = (
+                (semantic_intent == SemanticIntent.CODE and confidence >= 0.3) or
+                (semantic_intent == SemanticIntent.ACTION and confidence >= 0.4 and 
+                 any(keyword in user_input.lower() for keyword in 
+                     ['generate', 'create', 'write', 'build', 'make', 'script', 'code', 'program', 
+                      'file', 'scan', 'search', 'list', 'check', 'get', 'run']))
+            )
+            
+            if should_use_dual_exec:
+                logger.debug(f"Using dual execution orchestrator for non-streaming (intent: {semantic_intent}, confidence: {confidence:.2f})")
+                try:
+                    # Collect all output from generator
+                    output_parts = []
+                    for chunk in self.dual_execution_orchestrator.process_request(user_input, max_attempts=5):
+                        output_parts.append(chunk)
+                    
+                    response = "".join(output_parts)
+                    
+                    # Add to history
+                    context = self.get_context_summary()
+                    self.add_message("user", user_input, metadata={"context": context, "intent": semantic_intent.value})
+                    self.add_message(
+                        "assistant", response, metadata={"execution_mode": "dual_execution", "intent": semantic_intent.value}
+                    )
+                    
+                    return response
+                except Exception as e:
+                    logger.exception(f"Error using dual execution orchestrator: {e}")
+                    logger.info("Falling back to standard processing")
+
         # Add user message to history
         context = self.get_context_summary()
         self.add_message("user", user_input, metadata={"context": context, "intent": intent})
@@ -1278,9 +1314,18 @@ class ChatSession:
                 # Use semantic intent classifier instead of rigid keywords
                 intent, confidence = self.semantic_classifier.classify(user_input)
 
-                # Check for code intent with reasonable confidence
-                if intent == SemanticIntent.CODE and confidence >= 0.5:
-                    logger.debug(f"Using dual execution orchestrator for code execution (intent: {intent}, confidence: {confidence:.2f})")
+                # Check for code intent with reasonable confidence (lowered threshold to 0.3 for better catch rate)
+                # Also handle ACTION intents that involve code execution
+                should_use_dual_exec = (
+                    (intent == SemanticIntent.CODE and confidence >= 0.3) or
+                    (intent == SemanticIntent.ACTION and confidence >= 0.4 and 
+                     any(keyword in user_input.lower() for keyword in 
+                         ['generate', 'create', 'write', 'build', 'make', 'script', 'code', 'program', 
+                          'file', 'scan', 'search', 'list', 'check', 'get', 'run']))
+                )
+                
+                if should_use_dual_exec:
+                    logger.debug(f"Using dual execution orchestrator for execution (intent: {intent}, confidence: {confidence:.2f})")
                     try:
                         for chunk in self.dual_execution_orchestrator.process_request(
                             user_input, max_attempts=max_attempts
